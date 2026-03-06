@@ -10,24 +10,46 @@
 
 ## Overview
 
-**Qwen3-TTS Streaming Server** is a high-performance, production-ready FastAPI wrapper for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). This project forks the original repository to provide a standardized, easy-to-deploy streaming service with enhanced features for real-time applications.
+**Qwen3-TTS Streaming Server** is a high-performance, production-ready FastAPI wrapper for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). This project focuses on delivering ultra-low latency audio streaming for real-time human-computer interaction.
 
 ### What's New in This Fork?
-- **High-Performance FastAPI Server**: A dedicated server implementation (`server.py`) optimized for low-latency concurrency.
-- **Precision SSE Streaming**: Implements **Server-Sent Events (SSE)** for real-time audio token streaming.
-- **Sliding Window Audio Reconstruction**: Uses an advanced sliding window algorithm to ensure smooth, high-quality audio output during streaming.
-- **Production-Ready Configuration**: Full support for Environment Variables and CLI arguments for flexible deployment (Model path, Host, Port, Reference Audio/Text).
-- **Comprehensive Client Support**: Includes detailed integration guides and examples for Python and JavaScript (Web Audio API).
-- **Cleaned & Globalized**: Fully localized comments and logs in English, ready for the global open-source community.
+- **Extreme Performance Optimization**: Utilizes a specialized monkey-patching technique to intercept model forward passes, enabling the delivery of the first audio chunk almost instantly.
+- **High-Performance FastAPI Server**: Optimized for concurrent requests and low-latency throughput.
+- **Precision SSE Streaming**: Implements Server-Sent Events (SSE) for reliable real-time audio token delivery.
+- **Sliding Window Audio Reconstruction**: An advanced algorithm ensures seamless audio stitching and high-quality output during streaming.
+- **Production Configuration**: Full support for CLI arguments and Environment Variables (Model path, Host, Port, Reference Audio).
+
+---
+
+## Performance Benchmark
+
+Thanks to the internal optimization of the generation loop (intercepting tokens via forward hooks), the server achieves industry-leading response times.
+
+### Test Environment: NVIDIA RTX 4070
+**Input**: ~50 characters/words.
+
+```text
+Sending Payload: {"text":"[INPUT_TEXT]","language":"Chinese","stream":true}
+[T+245ms] First chunk received (2560 bytes)
+[T+311ms] Second chunk received
+[T+371ms] Third chunk received
+...
+[T+1405ms] Stream completed
+```
+
+**Key Metrics**:
+- **Time to First Chunk (TTFC)**: **~245ms**
+- **Chunk Interval**: ~60ms
+- **Stability**: Consistent throughput even with complex linguistic structures.
 
 ---
 
 ## Features
 
-* **Extreme Low-Latency**: Immediate first-packet delivery (~700ms-1300ms depending on text length).
-* **High-Fidelity Voice Cloning**: Supports 3-second rapid voice cloning with superior similarity.
-* **Stream & Non-Stream Support**: Standardized API for various integration scenarios.
-* **Automatic Language Detection**: Supports 10+ languages (CN, EN, JP, KR, DE, FR, RU, PT, ES, IT).
+* **Sub-300ms Latency**: First audio packet is delivered while the model is still generating the rest of the sentence.
+* **High-Fidelity Voice Cloning**: Supports rapid 3-second voice cloning with the 12Hz-1.7B-Base model.
+* **Stream & Non-Stream Support**: Flexible API for both real-time dialogue and batch generation.
+* **Multi-Language Support**: Native support for CN, EN, JP, KR, DE, FR, RU, PT, ES, IT.
 
 ---
 
@@ -35,13 +57,11 @@
 
 ### 1. Environment Setup
 
-We recommend using Python 3.12 with a clean environment:
-
 ```bash
 conda create -n qwen3-tts python=3.12 -y
 conda activate qwen3-tts
 pip install -U qwen-tts uvicorn fastapi soundfile
-# Optional: FlashAttention 2 for performance
+# Highly recommended: FlashAttention 2
 pip install -U flash-attn --no-build-isolation
 ```
 
@@ -57,13 +77,11 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./Qwen3-TT
 
 ### 3. Launch the Server
 
-Run the server with your desired configuration:
-
 ```bash
 python server.py \
   --model-path ./Qwen3-TTS-12Hz-1.7B-Base \
-  --ref-audio-file your_voice.wav \
-  --ref-text-file your_voice_transcript.txt \
+  --ref-audio-file reference.wav \
+  --ref-text-file reference.txt \
   --port 9000
 ```
 
@@ -71,16 +89,15 @@ python server.py \
 
 ## API Reference
 
-### 1. Streaming TTS (SSE)
+### Streaming TTS (SSE)
 **Endpoint**: `POST /tts/stream`
 
 **Request Body**:
 ```json
 {
-  "text": "Hello, this is a real-time streaming test.",
+  "text": "Hello world.",
   "language": "English",
-  "temperature": 0.5,
-  "max_new_tokens": 2048
+  "temperature": 0.5
 }
 ```
 
@@ -88,9 +105,6 @@ python server.py \
 - `{"type": "start"}`: Signals the start of generation.
 - `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1}`: Audio data chunk (WAV format).
 - `{"type": "done"}`: Signals completion.
-
-### 2. Health Check
-**Endpoint**: `GET /health`
 
 ---
 
@@ -110,17 +124,13 @@ python server.py \
 
 ### JavaScript / Frontend (Web Audio API)
 
-Receiving audio chunks via SSE requires careful handling of the WAV header and sample rate.
-
 ```javascript
-// Correct way to play streaming audio chunks in the browser
 async function playWavChunk(base64Data) {
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    const audioContext = new AudioContext({ sampleRate: 24000 });
     const binary = atob(base64Data);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     
-    // Decode complete WAV data (including the 44-byte header provided by the server)
     const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
     const source = audioContext.createBufferSource();
     source.buffer = audioBuffer;
@@ -129,16 +139,12 @@ async function playWavChunk(base64Data) {
 }
 ```
 
-**Common Pitfalls**:
-- **Noise only**: Usually caused by skipping the 44-byte WAV header or using the wrong sample rate (Fixed: Use `24000Hz`).
-- **Popping sounds**: Ensure you are using the `decodeAudioData` method which handles the underlying PCM format correctly.
-
 ---
 
 ## Credits
 
-Special thanks to the **Qwen Team** for developing and open-sourcing the revolutionary Qwen3-TTS models. This project is a community-driven extension to improve accessibility and deployment efficiency.
+Developed based on the excellent work of the **Qwen Team**. This extension aims to provide the community with a high-speed serving alternative for real-time AI applications.
 
 ## License
 
-This project follows the original [License](LICENSE). Please adhere to the terms provided by the Qwen team.
+Adheres to the original [License](LICENSE) provided by the Qwen team.
