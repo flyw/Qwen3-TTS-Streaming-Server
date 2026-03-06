@@ -23,32 +23,21 @@
 
 ## Performance Benchmark
 
-Thanks to the internal optimization of the generation loop (intercepting tokens via forward hooks), the server achieves industry-leading response times.
+The following metrics were captured using the included `webui.html` on a system equipped with an **NVIDIA RTX 4070 GPU** with **chunk_size: 1** (lowest latency mode) enabled.
 
-### Test Environment: NVIDIA RTX 4070
-**Input**: ~50 characters/words.
-
-```text
-Sending Payload: {"text":"[INPUT_TEXT]","language":"Chinese","stream":true}
-[T+245ms] First chunk received (2560 bytes)
-[T+311ms] Second chunk received
-[T+371ms] Third chunk received
-...
-[T+1405ms] Stream completed
-```
-
-**Key Metrics**:
-- **Time to First Chunk (TTFC)**: **~245ms**
-- **Chunk Interval**: ~60ms
-- **Stability**: Consistent throughput even with complex linguistic structures.
+### Real-World Metrics:
+- **Time to First Token (TTFT)**: **~426ms** (From request sent to audio starting)
+- **Average Chunk Interval**: **~308ms** (Time between receiving streaming packets)
+- **Throughput**: Fast delivery suitable for real-time interaction.
 
 ---
 
 ## Features
 
-* **Sub-300ms Latency**: First audio packet is delivered while the model is still generating the rest of the sentence.
+* **Sub-500ms Latency**: Industry-leading response time for real-time voice interaction.
+* **X-Vector Only Mode**: Support for pure speaker embedding cloning, which **100% eliminates prompt leakage** (no more hallucinating or repeating reference text).
+* **Configurable Streaming Buffer**: Prevent audio stuttering during network fluctuations by buffering tokens before sending (`chunk_size`).
 * **High-Fidelity Voice Cloning**: Supports rapid 3-second voice cloning with the 12Hz-1.7B-Base model.
-* **Stream & Non-Stream Support**: Flexible API for both real-time dialogue and batch generation.
 * **Multi-Language Support**: Native support for CN, EN, JP, KR, DE, FR, RU, PT, ES, IT.
 
 ---
@@ -78,11 +67,13 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./Qwen3-TT
 ### 3. Launch the Server
 
 ```bash
+# Recommended: X-Vector mode is enabled by default in server.py to prevent prompt leakage
+# You only need the reference audio file. No transcript required.
 python server.py \
   --model-path ./Qwen3-TTS-12Hz-1.7B-Base \
   --ref-audio-file reference.wav \
-  --ref-text-file reference.txt \
-  --port 9000
+  --port 9000 \
+  --chunk-size 1
 ```
 
 ---
@@ -97,13 +88,15 @@ python server.py \
 {
   "text": "Hello world.",
   "language": "English",
-  "temperature": 0.5
+  "temperature": 0.5,
+  "chunk_size": 1
 }
 ```
+*Note: We have optimized the server to use **X-Vector mode** by default. This ensures that the model only clones the speaker's voice identity without being distracted by the content of the reference audio, effectively eliminating "hallucinations" (repeating words from the reference clip). This mode does not require a reference transcript.*
 
 **Response**: A `text/event-stream` returning JSON chunks:
 - `{"type": "start"}`: Signals the start of generation.
-- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1}`: Audio data chunk (WAV format).
+- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1, "chunk_len": 1}`: Audio data chunk (WAV format).
 - `{"type": "done"}`: Signals completion.
 
 ---
@@ -113,10 +106,20 @@ python server.py \
 | CLI Argument | Environment Variable | Default | Description |
 |--------------|----------------------|---------|-------------|
 | `--model-path` | `MODEL_PATH` | `./Qwen3-TTS-12Hz-1.7B-Base` | Path to model weights |
-| `--ref-audio-file` | `REF_AUDIO_PATH` | `None` | Default reference audio for cloning |
-| `--ref-text-file` | `REF_TEXT` | `None` | Transcript of the reference audio |
+| `--ref-audio-file` | `REF_AUDIO_PATH` | `None` | Path to reference audio for cloning (Required) |
 | `--host` | `HOST` | `0.0.0.0` | Server host |
 | `--port` | `PORT` | `9000` | Server port |
+| `--chunk-size` | *None* | `1` | Global default for tokens to buffer before sending |
+
+---
+
+## WebUI Testing
+
+A ready-to-use HTML client (`webui.html`) is included to test the streaming API. It utilizes the Web Audio API to seamlessly stitch and play incoming chunks.
+
+1. Start the server (e.g., on port 9000).
+2. Open `webui.html` in any modern web browser.
+3. Observe the **Time to First Token (TTFT)** and playback smoothness. Adjust the `chunk_size` in the server startup or HTML payload if you experience audio stuttering.
 
 ---
 

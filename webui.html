@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen3-TTS Streaming Test</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f7f9;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            width: 550px;
+        }
+        h2 { color: #2c3e50; margin-top: 0; }
+        .server-config {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .server-config input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #dce4ec;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .server-config button {
+            background-color: #27ae60;
+            padding: 8px 16px;
+            font-size: 14px;
+        }
+        .server-config button:hover { background-color: #219a52; }
+        textarea {
+            width: 100%;
+            height: 120px;
+            padding: 10px;
+            border: 1px solid #dce4ec;
+            border-radius: 8px;
+            box-sizing: border-box;
+            font-size: 16px;
+            margin-bottom: 1rem;
+            resize: none;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+        button:hover { background-color: #2980b9; }
+        button:disabled { background-color: #bdc3c7; cursor: not-allowed; }
+        .status {
+            font-size: 14px;
+            color: #7f8c8d;
+        }
+        .stats {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #e74c3c;
+            margin-right: 5px;
+        }
+        .indicator.active { background: #2ecc71; animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Qwen3-TTS Streaming Test</h2>
+    
+    <div class="server-config">
+        <input type="text" id="serverUrl" placeholder="Server URL..." value="http://127.0.0.1:9000/tts/stream">
+        <button id="saveBtn">Save</button>
+    </div>
+    
+    <textarea id="inputText" placeholder="Enter text to synthesize...">Welcome to Qwen3-TTS, the advanced text-to-speech model by Alibaba. Experience natural and expressive voice synthesis.</textarea>
+
+    <div class="controls">
+        <button id="playBtn">Play</button>
+        <div class="status">
+            <span id="indicator" class="indicator"></span>
+            Status: <span id="statusText">Ready</span>
+        </div>
+    </div>
+
+    <div class="stats" id="statsBoard">
+        <div>First Token Latency (TTFT): <span id="ttft">---</span>ms</div>
+        <div>Chunks Received: <span id="chunkCount">0</span></div>
+        <div>Avg Interval: <span id="avgInterval">---</span>ms</div>
+    </div>
+</div>
+
+<script>
+    const STORAGE_KEY = "qwen3_tts_server_url";
+    
+    // Load saved server URL from localStorage
+    function loadServerUrl() {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+            document.getElementById('serverUrl').value = saved;
+        }
+    }
+    
+    function getServerUrl() {
+        return document.getElementById('serverUrl').value.trim();
+    }
+    
+    const saveBtn = document.getElementById('saveBtn');
+    const playBtn = document.getElementById('playBtn');
+    const inputText = document.getElementById('inputText');
+    const statusText = document.getElementById('statusText');
+    const indicator = document.getElementById('indicator');
+
+    // Stats elements
+    const ttftEl = document.getElementById('ttft');
+    const chunkCountEl = document.getElementById('chunkCount');
+    const avgIntervalEl = document.getElementById('avgInterval');
+
+    let audioCtx = null;
+    let nextStartTime = 0;
+    let startTime = 0;
+    let chunkCount = 0;
+    let lastChunkTime = 0;
+    let totalInterval = 0;
+
+    // Load saved URL on page load
+    loadServerUrl();
+
+    // Save server URL
+    saveBtn.onclick = () => {
+        const url = getServerUrl();
+        if (url) {
+            localStorage.setItem(STORAGE_KEY, url);
+            statusText.innerText = "Server URL saved!";
+            setTimeout(() => {
+                statusText.innerText = "Ready";
+            }, 2000);
+        }
+    };
+
+    async function initAudio() {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        }
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
+        nextStartTime = audioCtx.currentTime;
+    }
+
+    async function base64ToAudioBuffer(base64) {
+        const binaryString = window.atob(base64);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        return await audioCtx.decodeAudioData(bytes.buffer);
+    }
+
+    function resetStats() {
+        chunkCount = 0;
+        totalInterval = 0;
+        lastChunkTime = 0;
+        ttftEl.innerText = "---";
+        chunkCountEl.innerText = "0";
+        avgIntervalEl.innerText = "---";
+    }
+
+    playBtn.onclick = async () => {
+        const text = inputText.value.trim();
+        if (!text) return;
+
+        const SERVER_URL = getServerUrl();
+        if (!SERVER_URL) {
+            statusText.innerText = "Error: Server URL is empty";
+            return;
+        }
+
+        try {
+            playBtn.disabled = true;
+            statusText.innerText = "Initializing...";
+            resetStats();
+            await initAudio();
+
+            startTime = performance.now();
+            indicator.classList.add('active');
+            statusText.innerText = "Streaming audio...";
+
+            const response = await fetch(SERVER_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    text: text,
+                    language: "Chinese",
+                    chunk_size: 5,
+                    stream: true
+                })
+            });
+
+            if (!response.ok) throw new Error("Server response failed");
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n\n");
+                buffer = lines.pop(); // Keep incomplete line
+
+                for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                        const jsonStr = line.replace("data: ", "").trim();
+                        if (!jsonStr) continue;
+
+                        try {
+                            const payload = JSON.parse(jsonStr);
+                            if (payload.type === "audio") {
+                                handleAudioChunk(payload.data);
+                            } else if (payload.type === "done") {
+                                statusText.innerText = "Playback complete";
+                                indicator.classList.remove('active');
+                            }
+                        } catch (e) {
+                            console.error("JSON parse error", e);
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(error);
+            statusText.innerText = "Error: " + error.message;
+            indicator.classList.remove('active');
+        } finally {
+            playBtn.disabled = false;
+        }
+    };
+
+    async function handleAudioChunk(base64Data) {
+        const now = performance.now();
+        chunkCount++;
+
+        // Stats: first chunk latency
+        if (chunkCount === 1) {
+            const ttft = (now - startTime).toFixed(0);
+            ttftEl.innerText = ttft;
+            lastChunkTime = now;
+        } else {
+            const interval = now - lastChunkTime;
+            totalInterval += interval;
+            lastChunkTime = now;
+            avgIntervalEl.innerText = (totalInterval / (chunkCount - 1)).toFixed(0);
+        }
+        chunkCountEl.innerText = chunkCount;
+
+        // Decode and play
+        const audioBuffer = await base64ToAudioBuffer(base64Data);
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+
+        // Key logic: calculate when this chunk should start playing
+        const scheduledTime = Math.max(nextStartTime, audioCtx.currentTime);
+        source.start(scheduledTime);
+
+        // Update next playback start point
+        nextStartTime = scheduledTime + audioBuffer.duration;
+        statusText.innerText = `Playing (chunk ${chunkCount})...`;
+    }
+</script>
+
+</body>
+</html>
