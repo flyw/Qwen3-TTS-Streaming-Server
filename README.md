@@ -89,10 +89,13 @@ python server.py \
   "text": "Hello world.",
   "language": "English",
   "temperature": 0.5,
-  "chunk_size": 1
+  "chunk_size": 1,
+  "client_id": "user_123"
 }
 ```
 *Note: We have optimized the server to use **X-Vector mode** by default. This ensures that the model only clones the speaker's voice identity without being distracted by the content of the reference audio, effectively eliminating "hallucinations" (repeating words from the reference clip). This mode does not require a reference transcript.*
+
+*Concurrency Note: Use a unique `client_id` for each user. Requests with the same `client_id` will be processed **sequentially** (queued), while requests with different IDs will be processed **in parallel**.*
 
 **Response**: A `text/event-stream` returning JSON chunks:
 - `{"type": "start"}`: Signals the start of generation.
@@ -110,6 +113,7 @@ python server.py \
 | `--host` | `HOST` | `0.0.0.0` | Server host |
 | `--port` | `PORT` | `9000` | Server port |
 | `--chunk-size` | *None* | `1` | Global default for tokens to buffer before sending |
+| `client_id` | *API Only* | `"default"` | Unique ID per user to enable parallel processing and sequential order |
 
 ---
 
@@ -119,7 +123,11 @@ A ready-to-use HTML client (`webui.html`) is included to test the streaming API.
 
 1. Start the server (e.g., on port 9000).
 2. Open `webui.html` in any modern web browser.
-3. Observe the **Time to First Token (TTFT)** and playback smoothness. Adjust the `chunk_size` in the server startup or HTML payload if you experience audio stuttering.
+3. Configure your **Server URL** and **Client ID** (e.g., `user_1`), then click **Save**.
+4. Click **Play** to start synthesis. The interface is **non-blocking**, allowing you to trigger multiple requests.
+5. Observe the **Time to First Token (TTFT)** and playback smoothness. Adjust the `chunk_size` in the server startup or HTML payload if you experience audio stuttering.
+
+*Tip: Different **Client IDs** will be processed in parallel by the server, while the same ID will queue requests to maintain sequence.*
 
 ---
 

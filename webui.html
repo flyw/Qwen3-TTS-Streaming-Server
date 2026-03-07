@@ -104,6 +104,7 @@
     
     <div class="server-config">
         <input type="text" id="serverUrl" placeholder="Server URL..." value="http://127.0.0.1:9000/tts/stream">
+        <input type="text" id="clientId" placeholder="Client ID..." value="web-client-1">
         <button id="saveBtn">Save</button>
     </div>
     
@@ -125,18 +126,27 @@
 </div>
 
 <script>
-    const STORAGE_KEY = "qwen3_tts_server_url";
+    const STORAGE_KEY_URL = "qwen3_tts_server_url";
+    const STORAGE_KEY_ID = "qwen3_tts_client_id";
     
-    // Load saved server URL from localStorage
-    function loadServerUrl() {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-            document.getElementById('serverUrl').value = saved;
+    // Load saved server URL and Client ID from localStorage
+    function loadSettings() {
+        const savedUrl = localStorage.getItem(STORAGE_KEY_URL);
+        if (savedUrl) {
+            document.getElementById('serverUrl').value = savedUrl;
+        }
+        const savedId = localStorage.getItem(STORAGE_KEY_ID);
+        if (savedId) {
+            document.getElementById('clientId').value = savedId;
         }
     }
     
     function getServerUrl() {
         return document.getElementById('serverUrl').value.trim();
+    }
+
+    function getClientId() {
+        return document.getElementById('clientId').value.trim() || "default";
     }
     
     const saveBtn = document.getElementById('saveBtn');
@@ -157,19 +167,23 @@
     let lastChunkTime = 0;
     let totalInterval = 0;
 
-    // Load saved URL on page load
-    loadServerUrl();
+    // Load saved settings on page load
+    loadSettings();
 
-    // Save server URL
+    // Save settings
     saveBtn.onclick = () => {
         const url = getServerUrl();
+        const id = getClientId();
         if (url) {
-            localStorage.setItem(STORAGE_KEY, url);
-            statusText.innerText = "Server URL saved!";
-            setTimeout(() => {
-                statusText.innerText = "Ready";
-            }, 2000);
+            localStorage.setItem(STORAGE_KEY_URL, url);
         }
+        if (id) {
+            localStorage.setItem(STORAGE_KEY_ID, id);
+        }
+        statusText.innerText = "Settings saved!";
+        setTimeout(() => {
+            statusText.innerText = "Ready";
+        }, 2000);
     };
 
     async function initAudio() {
@@ -211,8 +225,9 @@
             return;
         }
 
+        const CLIENT_ID = getClientId();
+
         try {
-            playBtn.disabled = true;
             statusText.innerText = "Initializing...";
             resetStats();
             await initAudio();
@@ -228,6 +243,7 @@
                     text: text,
                     language: "Chinese",
                     chunk_size: 5,
+                    client_id: CLIENT_ID,
                     stream: true
                 })
             });
@@ -269,8 +285,6 @@
             console.error(error);
             statusText.innerText = "Error: " + error.message;
             indicator.classList.remove('active');
-        } finally {
-            playBtn.disabled = false;
         }
     };
 

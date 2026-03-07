@@ -22,9 +22,18 @@ from transformers.generation.streamers import BaseStreamer
 
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
+import contextvars
+from collections import defaultdict
+
 # ================= Configuration & Logging =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Qwen3-TTS")
+
+# Storage for per-client locks to ensure serial processing for each user while allowing cross-user parallelism
+client_locks = defaultdict(asyncio.Lock)
+
+# Context variable to route tokens to the correct request-specific streamer in a thread-safe way
+active_streamer: contextvars.ContextVar[Optional[BaseStreamer]] = contextvars.ContextVar("active_streamer", default=None)
 
 MODEL_PATH = os.getenv("MODEL_PATH", "./Qwen3-TTS-12Hz-1.7B-Base")
 REF_AUDIO_PATH = os.getenv("REF_AUDIO_PATH", None)
@@ -37,9 +46,8 @@ model_wrapper = None
 default_voice_prompt = None
 GLOBAL_SAVE_ENABLED = False 
 GLOBAL_CHUNK_SIZE = 1
-inference_lock = None
 
-app = FastAPI(title="Qwen3-TTS Precision Streaming Server")
+app = FastAPI(title="Qwen3-TTS Thread-Safe Parallel Server")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class TTSRequest(BaseModel):
@@ -49,6 +57,7 @@ class TTSRequest(BaseModel):
     max_new_tokens: int = 2048
     temperature: float = 0.5
     chunk_size: Optional[int] = Field(default=None, description="Number of tokens to buffer before sending")
+    client_id: Optional[str] = Field(default="default", description="Unique ID for each client to maintain sequence")
 
 def audio_to_base64_wav(wav: np.ndarray, sr: int) -> str:
     """Convert numpy array to standard WAV format encoded in Base64."""
@@ -196,50 +205,60 @@ class AudioTokenStreamer(BaseStreamer):
         self.loop.call_soon_threadsafe(self.queue.put_nowait, {"type": "done"})
 
 # ================= Server Logic =================
+def global_forward_hook(module, input, output):
+    """Global hook that routes codec_ids to the streamer in the current thread context."""
+    if hasattr(output, "hidden_states") and isinstance(output.hidden_states, tuple):
+        if len(output.hidden_states) > 1:
+            codec_ids = output.hidden_states[1] 
+            if codec_ids is not None and (codec_ids.dim() < 3 or codec_ids.shape[1] == 1):
+                streamer = active_streamer.get()
+                if streamer and hasattr(streamer, "handle_forward_token"):
+                    streamer.handle_forward_token(codec_ids)
+
 @app.on_event("startup")
 def load_model():
     global model_wrapper, default_voice_prompt
-    logger.info(f"Loading Qwen3-TTS with Default Settings...")
+    logger.info(f"Loading Qwen3-TTS and preparing thread-safe environment...")
     
-    # We force SDPA/Flash Attention 2 based on your previous benchmark results
-    # or keep it dynamic. Here we follow your environment.
     model_wrapper = Qwen3TTSModel.from_pretrained(
         MODEL_PATH, 
         device_map=DEVICE, 
         dtype=DTYPE
     )
     
-    # Monkey patch to bypass internal validation if necessary
+    # 1. Global Monkey Patch: inject the context-aware streamer into the generate call
+    original_talker_generate = model_wrapper.model.talker.generate
+    def thread_safe_generate(*args, **kwargs):
+        # Retrieve the streamer assigned to the current thread/context
+        s = active_streamer.get()
+        kwargs.pop("streamer", None)
+        return original_talker_generate(*args, streamer=s, **kwargs)
+    
+    model_wrapper.model.talker.generate = thread_safe_generate
+    
+    # 2. Global Forward Hook: register once, used by all parallel requests
+    model_wrapper.model.talker.register_forward_hook(global_forward_hook)
+    
     if hasattr(model_wrapper.model.talker, "_validate_model_kwargs"):
         model_wrapper.model.talker._validate_model_kwargs = lambda *args, **kwargs: None
         
     if REF_AUDIO_PATH and os.path.exists(REF_AUDIO_PATH):
-        logger.info(f"Loading default voice prompt from {REF_AUDIO_PATH} in X-VECTOR ONLY MODE")
-        # X-Vector mode extracts pure speaker embedding and discards text/codec context.
-        # This 100% prevents the model from hallucinating or repeating the reference text.
+        logger.info(f"Loading default voice prompt in X-VECTOR MODE")
         default_voice_prompt = model_wrapper.create_voice_clone_prompt(
             ref_audio=REF_AUDIO_PATH,
-            ref_text=None,  # Not needed in X-Vector mode
+            ref_text=None,
             x_vector_only_mode=True
         )
-    else:
-        logger.warning("No reference audio provided. System will require ref_audio in request.")
-    logger.info("Server is Ready.")
+    logger.info("Server is Parallel-Ready.")
 
 async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None]:
-    global inference_lock
-    if inference_lock is None:
-        inference_lock = asyncio.Lock()
-    
-    async with inference_lock:
-        # Standard space padding. Experiments show that too many newlines 
-        # can sometimes trigger the model to repeat the previous context.
+    # Acquire lock specific to this client_id to maintain sequence for each user
+    async with client_locks[request.client_id]:
+        # Standard space padding
         clean_text = " " + request.text.strip()
         
         queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
-        
-        # Priority: Request Specific > Global CLI Default > 1
         active_chunk_size = request.chunk_size if request.chunk_size is not None else GLOBAL_CHUNK_SIZE
         
         streamer = AudioTokenStreamer(
@@ -251,23 +270,9 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
             chunk_size=active_chunk_size
         )
 
-        def forward_hook(module, input, output):
-            if hasattr(output, "hidden_states") and isinstance(output.hidden_states, tuple):
-                if len(output.hidden_states) > 1:
-                    codec_ids = output.hidden_states[1] 
-                    if codec_ids is not None and (codec_ids.dim() < 3 or codec_ids.shape[1] == 1):
-                        streamer.handle_forward_token(codec_ids)
-
-        # Robust Monkey Patch to prevent duplicate streamer passing
-        original_talker_generate = model_wrapper.model.talker.generate
-        def patched_generate(*args, **kwargs):
-            kwargs.pop("streamer", None)
-            return original_talker_generate(*args, streamer=streamer, **kwargs)
-        
-        model_wrapper.model.talker.generate = patched_generate
-        hook_handle = model_wrapper.model.talker.register_forward_hook(forward_hook)
-
         def run_inference():
+            # Set the context for this specific thread
+            token = active_streamer.set(streamer)
             try:
                 model_wrapper.generate_voice_clone(
                     text=clean_text, 
@@ -279,12 +284,12 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
                 logger.error(f"Inference Thread Error: {e}")
                 loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "message": str(e)})
             finally:
-                # Remove hook and restore generate method before signaling completion
-                hook_handle.remove()
-                model_wrapper.model.talker.generate = original_talker_generate
+                active_streamer.reset(token)
                 loop.call_soon_threadsafe(queue.put_nowait, {"type": "done"})
 
-        threading.Thread(target=run_inference).start()
+        # Run in a separate thread but maintain context propagation
+        asyncio.create_task(asyncio.to_thread(run_inference))
+        
         yield f"data: {json.dumps({'type': 'start'})}\n\n"
         
         while True:
@@ -296,7 +301,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
 
 @app.post("/tts/stream")
 async def tts_stream(request: TTSRequest):
-    logger.info(f"Received request (ChunkSize: {request.chunk_size}): {request.text[:20]}...")
+    logger.info(f"Received request (ClientID: {request.client_id}, ChunkSize: {request.chunk_size}): {request.text[:20]}...")
     return StreamingResponse(generate_token_stream(request), media_type="text/event-stream")
 
 @app.get("/health")
