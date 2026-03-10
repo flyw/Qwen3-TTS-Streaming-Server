@@ -107,7 +107,13 @@
         <input type="text" id="clientId" placeholder="Client ID..." value="web-client-1">
         <button id="saveBtn">Save</button>
     </div>
-    
+
+    <div class="server-config">
+        <label for="chunkSize" style="font-size: 14px; color: #2c3e50;">Chunk Size:</label>
+        <input type="number" id="chunkSize" min="1" max="20" value="5" style="width: 60px;">
+        <span style="font-size: 12px; color: #7f8c8d;">(1-20, default: 5)</span>
+    </div>
+
     <textarea id="inputText" placeholder="Enter text to synthesize...">Welcome to Qwen3-TTS, the advanced text-to-speech model by Alibaba. Experience natural and expressive voice synthesis.</textarea>
 
     <div class="controls">
@@ -128,7 +134,8 @@
 <script>
     const STORAGE_KEY_URL = "qwen3_tts_server_url";
     const STORAGE_KEY_ID = "qwen3_tts_client_id";
-    
+    const STORAGE_KEY_CHUNK = "qwen3_tts_chunk_size";
+
     // Load saved server URL and Client ID from localStorage
     function loadSettings() {
         const savedUrl = localStorage.getItem(STORAGE_KEY_URL);
@@ -139,6 +146,10 @@
         if (savedId) {
             document.getElementById('clientId').value = savedId;
         }
+        const savedChunk = localStorage.getItem(STORAGE_KEY_CHUNK);
+        if (savedChunk) {
+            document.getElementById('chunkSize').value = savedChunk;
+        }
     }
     
     function getServerUrl() {
@@ -148,7 +159,12 @@
     function getClientId() {
         return document.getElementById('clientId').value.trim() || "default";
     }
-    
+
+    function getChunkSize() {
+        const size = parseInt(document.getElementById('chunkSize').value);
+        return Math.max(1, Math.min(20, size || 5));
+    }
+
     const saveBtn = document.getElementById('saveBtn');
     const playBtn = document.getElementById('playBtn');
     const inputText = document.getElementById('inputText');
@@ -174,12 +190,14 @@
     saveBtn.onclick = () => {
         const url = getServerUrl();
         const id = getClientId();
+        const chunk = getChunkSize();
         if (url) {
             localStorage.setItem(STORAGE_KEY_URL, url);
         }
         if (id) {
             localStorage.setItem(STORAGE_KEY_ID, id);
         }
+        localStorage.setItem(STORAGE_KEY_CHUNK, chunk);
         statusText.innerText = "Settings saved!";
         setTimeout(() => {
             statusText.innerText = "Ready";
@@ -242,7 +260,7 @@
                 body: JSON.stringify({
                     text: text,
                     language: "Chinese",
-                    chunk_size: 5,
+                    chunk_size: getChunkSize(),
                     client_id: CLIENT_ID,
                     stream: true
                 })
