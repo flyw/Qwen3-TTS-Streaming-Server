@@ -57,6 +57,7 @@ class TTSRequest(BaseModel):
     max_new_tokens: int = 2048
     temperature: float = 0.5
     chunk_size: Optional[int] = Field(default=None, description="Number of tokens to buffer before sending")
+    pre_buffer: int = Field(default=0, description="Number of chunks to buffer on server before sending the first packet")
     client_id: Optional[str] = Field(default="default", description="Unique ID for each client to maintain sequence")
 
 def audio_to_base64_wav(wav: np.ndarray, sr: int) -> str:
@@ -72,7 +73,7 @@ class AudioTokenStreamer(BaseStreamer):
     Handles real-time audio token streaming with a sliding window approach
     to maintain audio continuity and minimize latency.
     """
-    def __init__(self, model_wrapper, queue, loop, voice_prompt=None, save_enabled=False, chunk_size=5):
+    def __init__(self, model_wrapper, queue, loop, voice_prompt=None, save_enabled=False, chunk_size=5, pre_buffer=0):
         self.model_wrapper = model_wrapper
         self.queue = queue
         self.loop = loop
@@ -85,7 +86,9 @@ class AudioTokenStreamer(BaseStreamer):
         
         # Buffering for network stability
         self.chunk_size = chunk_size
+        self.pre_buffer_limit = pre_buffer
         self.audio_buffer = []
+        self.pre_buffer_storage = [] # To store chunks during pre-buffering phase
         self.last_sent_index = 0
         
         # Get dynamic upsample rate (typically 2000 for 12Hz models)
@@ -114,8 +117,32 @@ class AudioTokenStreamer(BaseStreamer):
 
         try:
             combined_wav = np.concatenate(self.audio_buffer)
+            self.audio_buffer = []
+
+            # Server-side Pre-buffering logic
+            if self.actual_sent_count < self.pre_buffer_limit:
+                self.pre_buffer_storage.append(combined_wav)
+                self.actual_sent_count += 1
+                
+                # If we just hit the limit, send all buffered chunks at once
+                if self.actual_sent_count == self.pre_buffer_limit:
+                    all_pre_wav = np.concatenate(self.pre_buffer_storage)
+                    audio_b64 = audio_to_base64_wav(all_pre_wav, self.sample_rate)
+                    self.loop.call_soon_threadsafe(
+                        self.queue.put_nowait, 
+                        {
+                            "type": "audio", 
+                            "data": audio_b64, 
+                            "index": 1, 
+                            "is_prebuffered": True,
+                            "chunk_len": len(self.pre_buffer_storage)
+                        }
+                    )
+                    self.pre_buffer_storage = []
+                return
+
+            # Normal streaming phase
             audio_b64 = audio_to_base64_wav(combined_wav, self.sample_rate)
-            
             self.actual_sent_count += 1
             self.loop.call_soon_threadsafe(
                 self.queue.put_nowait, 
@@ -123,10 +150,9 @@ class AudioTokenStreamer(BaseStreamer):
                     "type": "audio", 
                     "data": audio_b64, 
                     "index": self.actual_sent_count, 
-                    "chunk_len": len(self.audio_buffer)
+                    "chunk_len": 1
                 }
             )
-            self.audio_buffer = []
         except Exception as e:
             logger.error(f"Error flushing audio buffer: {e}")
 
@@ -191,6 +217,18 @@ class AudioTokenStreamer(BaseStreamer):
 
     def put(self, value): pass
     def end(self):
+        # If we finished before hitting pre_buffer_limit, flush whatever we have
+        if self.pre_buffer_storage:
+            try:
+                all_pre_wav = np.concatenate(self.pre_buffer_storage)
+                audio_b64 = audio_to_base64_wav(all_pre_wav, self.sample_rate)
+                self.loop.call_soon_threadsafe(
+                    self.queue.put_nowait, 
+                    {"type": "audio", "data": audio_b64, "index": 1, "is_prebuffered": True}
+                )
+                self.pre_buffer_storage = []
+            except: pass
+
         # Ensure remaining audio in buffer is sent
         self.flush_buffer()
         
@@ -267,7 +305,8 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
             loop, 
             voice_prompt=default_voice_prompt, 
             save_enabled=GLOBAL_SAVE_ENABLED,
-            chunk_size=active_chunk_size
+            chunk_size=active_chunk_size,
+            pre_buffer=request.pre_buffer
         )
 
         def run_inference():
@@ -301,7 +340,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
 
 @app.post("/tts/stream")
 async def tts_stream(request: TTSRequest):
-    logger.info(f"Received request (ClientID: {request.client_id}, ChunkSize: {request.chunk_size}): {request.text[:20]}...")
+    logger.info(f"Received request (ClientID: {request.client_id}, ChunkSize: {request.chunk_size}, PreBuffer: {request.pre_buffer}): {request.text[:20]}...")
     return StreamingResponse(generate_token_stream(request), media_type="text/event-stream")
 
 @app.get("/health")

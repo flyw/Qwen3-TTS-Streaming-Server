@@ -18,6 +18,7 @@
 - **Precision SSE Streaming**: Implements Server-Sent Events (SSE) for reliable real-time audio token delivery.
 - **Sliding Window Audio Reconstruction**: An advanced algorithm ensures seamless audio stitching and high-quality output during streaming.
 - **Production Configuration**: Full support for CLI arguments and Environment Variables (Model path, Host, Port, Reference Audio).
+- **Anti-Jitter Buffering**: Built-in server-side and client-side pre-buffering to ensure smooth playback even under high GPU load or network fluctuations.
 
 ---
 
@@ -37,6 +38,7 @@ The following metrics were captured using the included `webui.html` on a system 
 * **Sub-500ms Latency**: Industry-leading response time for real-time voice interaction.
 * **X-Vector Only Mode**: Support for pure speaker embedding cloning, which **100% eliminates prompt leakage** (no more hallucinating or repeating reference text).
 * **Configurable Streaming Buffer**: Prevent audio stuttering during network fluctuations by buffering tokens before sending (`chunk_size`).
+* **Server-Side Pre-Buffering**: Accumulate initial chunks before sending the first packet (`pre_buffer`) to provide a stable initial stream.
 * **High-Fidelity Voice Cloning**: Supports rapid 3-second voice cloning with the 12Hz-1.7B-Base model.
 * **Multi-Language Support**: Native support for CN, EN, JP, KR, DE, FR, RU, PT, ES, IT.
 
@@ -89,17 +91,18 @@ python server.py \
   "text": "Hello world.",
   "language": "English",
   "temperature": 0.5,
-  "chunk_size": 1,
+  "chunk_size": 5,
+  "pre_buffer": 3,
   "client_id": "user_123"
 }
 ```
-*Note: We have optimized the server to use **X-Vector mode** by default. This ensures that the model only clones the speaker's voice identity without being distracted by the content of the reference audio, effectively eliminating "hallucinations" (repeating words from the reference clip). This mode does not require a reference transcript.*
-
-*Concurrency Note: Use a unique `client_id` for each user. Requests with the same `client_id` will be processed **sequentially** (queued), while requests with different IDs will be processed **in parallel**.*
+*   **chunk_size**: Number of tokens to buffer before sending a single SSE packet. (e.g., 12 tokens $\approx$ 1s of audio for 12Hz models).
+*   **pre_buffer**: Number of initial chunks to buffer on the server before sending the very first data packet. This creates a "head start" for the player to prevent stuttering under load.
+*   **client_id**: Unique ID per user. Requests with the same ID are processed **sequentially**, while different IDs are processed **in parallel**.
 
 **Response**: A `text/event-stream` returning JSON chunks:
 - `{"type": "start"}`: Signals the start of generation.
-- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1, "chunk_len": 1}`: Audio data chunk (WAV format).
+- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1, "is_prebuffered": true}`: Audio data chunk.
 - `{"type": "done"}`: Signals completion.
 
 ---
@@ -113,42 +116,149 @@ python server.py \
 | `--host` | `HOST` | `0.0.0.0` | Server host |
 | `--port` | `PORT` | `9000` | Server port |
 | `--chunk-size` | *None* | `1` | Global default for tokens to buffer before sending |
-| `client_id` | *API Only* | `"default"` | Unique ID per user to enable parallel processing and sequential order |
+| `pre_buffer` | *API Only* | `0` | Initial chunks to buffer on server for the first packet |
+| `client_id` | *API Only* | `"default"` | Unique ID per user to enable parallel processing |
 
 ---
 
 ## WebUI Testing
 
-A ready-to-use HTML client (`webui.html`) is included to test the streaming API. It utilizes the Web Audio API to seamlessly stitch and play incoming chunks.
+A ready-to-use HTML client (`webui.html`) is included to test the streaming API. It features a high-performance **Anti-Jitter Buffer** implementation.
 
 1. Start the server (e.g., on port 9000).
 2. Open `webui.html` in any modern web browser.
-3. Configure your **Server URL** and **Client ID** (e.g., `user_1`), then click **Save**.
-4. Click **Play** to start synthesis. The interface is **non-blocking**, allowing you to trigger multiple requests.
-5. Observe the **Time to First Token (TTFT)** and playback smoothness. Adjust the `chunk_size` in the server startup or HTML payload if you experience audio stuttering.
+3. Configure your **Server URL** and **Client ID**.
+4. **Optimization Settings**:
+    - **Chunk Size**: Adjust how many tokens are in each network packet. Increase this (e.g., to 10-15) for better efficiency on high-latency networks.
+    - **Pre-buffer**: Set the initial buffer depth. If you experience stuttering (RTF < 1.2), set this to 3 or 4.
+5. Click **Play** to start synthesis. 
+6. Observe the **Buffered** count in the stats board. If it drops to 0 during playback, increase your `Pre-buffer`.
 
-*Tip: Different **Client IDs** will be processed in parallel by the server, while the same ID will queue requests to maintain sequence.*
+---
 
 ---
 
 ## Client Integration Guide
 
-### JavaScript / Frontend (Web Audio API)
+Integrating a streaming TTS requires handling **Server-Sent Events (SSE)** and managing an **Audio Jitter Buffer** to ensure gapless playback.
+
+### 1. High-Level Architecture
+1.  **Request**: Send a `POST` request to `/tts/stream` with `stream: true`.
+2.  **Stream Consumption**: Use `fetch` and `ReadableStream` (since standard `EventSource` doesn't support POST).
+3.  **Decoding**: Decode Base64-encoded WAV chunks into `AudioBuffer`.
+4.  **Scheduling**: Use the Web Audio API to schedule each chunk at a precise `startTime` to avoid clicks or gaps.
+
+### 2. Complete JavaScript Implementation
 
 ```javascript
-async function playWavChunk(base64Data) {
-    const audioContext = new AudioContext({ sampleRate: 24000 });
-    const binary = atob(base64Data);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    
-    const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    source.start(0);
+class Qwen3TTSPlayer {
+    constructor(sampleRate = 24000) {
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+        this.nextStartTime = 0; // Tracks the end time of the last scheduled chunk
+        this.isPlaying = false;
+    }
+
+    /**
+     * Synthesize and play text
+     * @param {string} text - Text to speak
+     * @param {Object} options - API options (chunk_size, pre_buffer, etc.)
+     */
+    async speak(text, options = {}) {
+        // Ensure AudioContext is active (browsers block audio until user interaction)
+        if (this.audioCtx.state === 'suspended') await this.audioCtx.resume();
+        
+        // Reset timing for a new sentence
+        this.nextStartTime = this.audioCtx.currentTime;
+        this.isPlaying = true;
+
+        try {
+            const response = await fetch('http://localhost:9000/tts/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    text,
+                    language: "Chinese",
+                    chunk_size: 5,
+                    pre_buffer: 3,
+                    stream: true,
+                    ...options
+                })
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n\n");
+                buffer = lines.pop(); // Keep incomplete JSON line
+
+                for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                        const jsonStr = line.replace("data: ", "").trim();
+                        const payload = JSON.parse(jsonStr);
+
+                        if (payload.type === "audio") {
+                            await this.schedulePlayback(payload.data);
+                        } else if (payload.type === "done") {
+                            console.log("Stream finished");
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("Playback Error:", err);
+        } finally {
+            this.isPlaying = false;
+        }
+    }
+
+    /**
+     * Decodes Base64 to AudioBuffer and schedules it in the Web Audio timeline
+     */
+    async schedulePlayback(base64Data) {
+        // Convert Base64 to ArrayBuffer
+        const binary = atob(base64Data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        
+        // Decode audio data
+        const audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer);
+        
+        // Create BufferSource
+        const source = this.audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(this.audioCtx.destination);
+
+        // Calculate start time: 
+        // We use either the current time or the end of the previous chunk, whichever is later.
+        const now = this.audioCtx.currentTime;
+        const startTime = Math.max(now, this.nextStartTime);
+        
+        source.start(startTime);
+
+        // Update the timeline
+        this.nextStartTime = startTime + audioBuffer.duration;
+    }
 }
+
+// Usage:
+// const player = new Qwen3TTSPlayer();
+// player.speak("欢迎使用通义千问语音大模型。");
 ```
+
+### 3. Key Optimization Tips
+
+- **Next Start Time Tracking**: Never use `source.start(0)`. Always track `nextStartTime = startTime + buffer.duration` to ensure the next chunk starts exactly where the previous one ended.
+- **Handling Network Jitter**: 
+    - **Server Side**: Set `pre_buffer` (e.g., 3) to send a larger first packet.
+    - **Client Side**: If your RTF is close to 1.0, wait for 2-3 chunks to arrive before starting the very first `source.start()`.
+- **Sample Rate**: Qwen3-TTS outputs **24,000Hz**. Hardcoding this in your `AudioContext` prevents the browser from doing expensive resampling.
+- **WAV Headers**: The server sends each chunk as a standard WAV file. Most modern browsers' `decodeAudioData` handle this seamlessly, even if headers are repeated per chunk.
 
 ---
 
