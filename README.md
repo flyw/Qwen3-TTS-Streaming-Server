@@ -15,21 +15,21 @@
 ### What's New in This Fork?
 - **Extreme Performance Optimization**: Utilizes a specialized monkey-patching technique to intercept model forward passes, enabling the delivery of the first audio chunk almost instantly.
 - **High-Performance FastAPI Server**: Optimized for concurrent requests and low-latency throughput.
-- **Precision SSE Streaming**: Implements Server-Sent Events (SSE) for reliable real-time audio token delivery.
+- **Raw Binary Streaming**: Replaced SSE/Base64 with raw **PCM 16-bit** binary streaming, reducing bandwidth overhead by **~33%** and lowering client-side CPU usage.
 - **Sliding Window Audio Reconstruction**: An advanced algorithm ensures seamless audio stitching and high-quality output during streaming.
 - **Production Configuration**: Full support for CLI arguments and Environment Variables (Model path, Host, Port, Reference Audio).
-- **Anti-Jitter Buffering**: Built-in server-side and client-side pre-buffering to ensure smooth playback even under high GPU load or network fluctuations.
+- **Batch Decoding**: Configurable `chunk-size` on the server to balance RTF performance and real-time feel.
 
 ---
 
 ## Performance Benchmark
 
-The following metrics were captured using the included `webui.html` on a system equipped with an **NVIDIA RTX 4070 GPU** with **chunk_size: 1** (lowest latency mode) enabled.
+The following metrics were captured using the included `webui.html` on a system equipped with an **NVIDIA RTX 4070 GPU** with **chunk_size: 6** enabled.
 
 ### Real-World Metrics:
-- **Time to First Token (TTFT)**: **~426ms** (From request sent to audio starting)
-- **Average Chunk Interval**: **~308ms** (Time between receiving streaming packets)
-- **Throughput**: Fast delivery suitable for real-time interaction.
+- **Time to First Byte (TTFB)**: **~380ms** (From request sent to first audio data arrival)
+- **Real-Time Factor (RTF)**: **0.7 - 0.9** (Generating 1s of audio in 0.7s - 0.9s)
+- **Throughput**: Zero-overhead binary delivery suitable for production-scale interaction.
 
 ---
 
@@ -83,7 +83,7 @@ python server.py \
 
 ## API Reference
 
-### Streaming TTS (SSE)
+### Streaming TTS (Binary)
 **Endpoint**: `POST /tts/stream`
 
 **Request Body**:
@@ -95,15 +95,10 @@ python server.py \
   "client_id": "user_123"
 }
 ```
-*   **text**: The text to synthesize.
-*   **language**: Target language (Chinese, English, Japanese, Korean, Cantonese).
-*   **temperature**: Controls expressiveness (0.1 to 1.0).
-*   **client_id**: Unique ID per user. Requests with the same ID are processed **sequentially**, while different IDs are processed **in parallel**.
 
-**Response**: A `text/event-stream` returning JSON chunks:
-- `{"type": "start", "total_chunks": 1}`: Signals the start of generation.
-- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1}`: Audio data chunk.
-- `{"type": "done"}`: Signals completion.
+**Response**: `audio/l16;rate=24000`
+- The server returns a continuous stream of raw **PCM 16-bit (Little Endian), Mono, 24,000Hz** bytes.
+- There is no JSON wrapping or Base64 encoding. Every byte is actual audio data.
 
 ---
 
@@ -136,64 +131,59 @@ A ready-to-use HTML client (`webui.html`) is included to test the streaming API.
 
 ---
 
-## Client Integration Guide
+## Client Integration Guide (Binary)
 
 ### 1. High-Level Architecture
 1.  **Request**: Send a `POST` request to `/tts/stream`.
-2.  **Stream Consumption**: Use `fetch` and `ReadableStream`.
-3.  **Decoding**: Decode Base64-encoded WAV chunks into `AudioBuffer`.
-4.  **Scheduling**: Use the Web Audio API to schedule each chunk.
+2.  **Stream Consumption**: Use `fetch` and `response.body.getReader()`.
+3.  **Conversion**: Convert the incoming `Uint8Array` (bytes) to `Int16Array`, then normalize to `Float32` for Web Audio.
+4.  **Playback**: Schedule buffers using `AudioContext.createBufferSource()`.
 
-### 2. Complete JavaScript Implementation
+### 2. JavaScript Implementation
 
 ```javascript
-async function speak(text, options = {}) {
+async function speakBinary(text) {
+    const audioCtx = new AudioContext({ sampleRate: 24000 });
+    let nextStartTime = audioCtx.currentTime;
+
     const response = await fetch('http://localhost:9000/tts/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            text,
-            language: "Chinese",
-            temperature: 0.5,
-            ...options
-        })
+        body: JSON.stringify({ text, language: "Chinese" })
     });
 
     const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
 
     while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await reader.read(); // value is Uint8Array
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop();
-
-        for (const line of lines) {
-            if (line.startsWith("data: ")) {
-                const jsonStr = line.replace("data: ", "").trim();
-                const payload = JSON.parse(jsonStr);
-
-                if (payload.type === "audio") {
-                    // Convert Base64 to ArrayBuffer and play using Web Audio API
-                    await playChunk(payload.data);
-                }
-            }
+        // Convert PCM16 bytes to Float32
+        const int16Array = new Int16Array(value.buffer, value.byteOffset, value.byteLength / 2);
+        const float32Array = new Float32Array(int16Array.length);
+        for (let i = 0; i < int16Array.length; i++) {
+            float32Array[i] = int16Array[i] / 32768.0;
         }
+
+        // Create and play buffer
+        const buffer = audioCtx.createBuffer(1, float32Array.length, 24000);
+        buffer.getChannelData(0).set(float32Array);
+        
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        
+        const startTime = Math.max(audioCtx.currentTime, nextStartTime);
+        source.start(startTime);
+        nextStartTime = startTime + buffer.duration;
     }
 }
 ```
 
 ### 3. Key Optimization Tips
-
-- **Next Start Time Tracking**: Never use `source.start(0)`. Always track `nextStartTime = startTime + buffer.duration` to ensure the next chunk starts exactly where the previous one ended.
-- **Handling Network Jitter**: 
-    - **Server Side**: Set `pre_buffer` (e.g., 3) to send a larger first packet.
-    - **Client Side**: If your RTF is close to 1.0, wait for 2-3 chunks to arrive before starting the very first `source.start()`.
-- **Sample Rate**: Qwen3-TTS outputs **24,000Hz**. Hardcoding this in your `AudioContext` prevents the browser from doing expensive resampling.
-- **WAV Headers**: The server sends each chunk as a standard WAV file. Most modern browsers' `decodeAudioData` handle this seamlessly, even if headers are repeated per chunk.
+- **Binary Conversion**: Using `Int16Array` view on the `Uint8Array.buffer` is extremely fast and avoids manual byte shifting.
+- **Sample Rate**: Ensure your `AudioContext` is locked to **24000Hz** to match the server output and avoid browser-side resampling.
+- **No SSE Overhead**: Since there's no JSON parsing, you can process packets of any size immediately as they arrive.
 
 ---
 

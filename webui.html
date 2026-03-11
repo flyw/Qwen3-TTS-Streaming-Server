@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Qwen3-TTS Streaming Test</title>
+    <title>Qwen3-TTS Streaming Test (Binary Mode)</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -105,7 +105,7 @@
 <body>
 
 <div class="container">
-    <h2>Qwen3-TTS Streaming Test</h2>
+    <h2>Qwen3-TTS Binary Stream</h2>
     
     <div class="server-config">
         <input type="text" id="serverUrl" placeholder="Server URL..." value="http://127.0.0.1:9000/tts/stream">
@@ -128,7 +128,7 @@
         <span id="tempValue" style="font-size: 13px; color: #3498db; font-weight: bold; width: 30px; display: inline-block;">0.50</span>
     </div>
 
-    <textarea id="inputText" placeholder="Enter text to synthesize...">Welcome to Qwen3-TTS, the advanced text-to-speech model by Alibaba. Experience natural and expressive voice synthesis.</textarea>
+    <textarea id="inputText" placeholder="Enter text to synthesize...">Welcome to Qwen3-TTS. This is a high-performance raw binary stream without Base64 overhead.</textarea>
 
     <div class="controls">
         <button id="playBtn">Play</button>
@@ -139,9 +139,9 @@
     </div>
 
     <div class="stats" id="statsBoard">
-        <div>First Token Latency (TTFT): <span id="ttft">---</span>ms</div>
+        <div>First Byte Latency (TTFB): <span id="ttft">---</span>ms</div>
         <div>Chunks Received: <span id="chunkCount">0</span></div>
-        <div>Buffered: <span id="bufferedCount">0</span></div>
+        <div>Buffered Chunks: <span id="bufferedCount">0</span></div>
         <div>Avg Interval: <span id="avgInterval">---</span>ms</div>
     </div>
 </div>
@@ -150,43 +150,26 @@
     const STORAGE_KEY_URL = "qwen3_tts_server_url";
     const STORAGE_KEY_ID = "qwen3_tts_client_id";
 
-    // Load saved server URL and Client ID from localStorage
     function loadSettings() {
         const savedUrl = localStorage.getItem(STORAGE_KEY_URL);
-        if (savedUrl) {
-            document.getElementById('serverUrl').value = savedUrl;
-        }
+        if (savedUrl) document.getElementById('serverUrl').value = savedUrl;
         const savedId = localStorage.getItem(STORAGE_KEY_ID);
-        if (savedId) {
-            document.getElementById('clientId').value = savedId;
-        }
+        if (savedId) document.getElementById('clientId').value = savedId;
     }
     
-    function getServerUrl() {
-        return document.getElementById('serverUrl').value.trim();
-    }
-
-    function getClientId() {
-        return document.getElementById('clientId').value.trim() || "default";
-    }
+    function getServerUrl() { return document.getElementById('serverUrl').value.trim(); }
+    function getClientId() { return document.getElementById('clientId').value.trim() || "default"; }
 
     const saveBtn = document.getElementById('saveBtn');
     const playBtn = document.getElementById('playBtn');
     const inputText = document.getElementById('inputText');
     const statusText = document.getElementById('statusText');
     const indicator = document.getElementById('indicator');
-
-    // Config elements
+    
     const languageSelect = document.getElementById('languageSelect');
     const tempSlider = document.getElementById('tempSlider');
     const tempValue = document.getElementById('tempValue');
 
-    // Update temp value display
-    tempSlider.oninput = () => {
-        tempValue.innerText = parseFloat(tempSlider.value).toFixed(2);
-    };
-
-    // Stats elements
     const ttftEl = document.getElementById('ttft');
     const chunkCountEl = document.getElementById('chunkCount');
     const bufferedCountEl = document.getElementById('bufferedCount');
@@ -203,43 +186,20 @@
     let isPlaying = false;
     let isFinished = false;
 
-    // Load saved settings on page load
     loadSettings();
+    tempSlider.oninput = () => { tempValue.innerText = parseFloat(tempSlider.value).toFixed(2); };
 
-    // Save settings
     saveBtn.onclick = () => {
-        const url = getServerUrl();
-        const id = getClientId();
-        if (url) {
-            localStorage.setItem(STORAGE_KEY_URL, url);
-        }
-        if (id) {
-            localStorage.setItem(STORAGE_KEY_ID, id);
-        }
-        statusText.innerText = "Settings saved!";
-        setTimeout(() => {
-            statusText.innerText = "Ready";
-        }, 2000);
+        localStorage.setItem(STORAGE_KEY_URL, getServerUrl());
+        localStorage.setItem(STORAGE_KEY_ID, getClientId());
+        statusText.innerText = "Saved!";
+        setTimeout(() => { statusText.innerText = "Ready"; }, 1000);
     };
 
     async function initAudio() {
-        if (!audioCtx) {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-        }
-        if (audioCtx.state === 'suspended') {
-            await audioCtx.resume();
-        }
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
         nextStartTime = audioCtx.currentTime;
-    }
-
-    async function base64ToAudioBuffer(base64) {
-        const binaryString = window.atob(base64);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
-        return await audioCtx.decodeAudioData(bytes.buffer);
     }
 
     function resetStats() {
@@ -260,13 +220,6 @@
         if (!text) return;
 
         const SERVER_URL = getServerUrl();
-        if (!SERVER_URL) {
-            statusText.innerText = "Error: Server URL is empty";
-            return;
-        }
-
-        const CLIENT_ID = getClientId();
-
         try {
             statusText.innerText = "Initializing...";
             resetStats();
@@ -274,7 +227,7 @@
 
             startTime = performance.now();
             indicator.classList.add('active');
-            statusText.innerText = "Streaming audio...";
+            statusText.innerText = "Receiving Binary Stream...";
 
             const response = await fetch(SERVER_URL, {
                 method: 'POST',
@@ -283,41 +236,23 @@
                     text: text,
                     language: languageSelect.value,
                     temperature: parseFloat(tempSlider.value),
-                    client_id: CLIENT_ID
+                    client_id: getClientId()
                 })
             });
 
-            if (!response.ok) throw new Error("Server response failed");
+            if (!response.ok) throw new Error("Server Error");
 
             const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
-
+            
             while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n\n");
-                buffer = lines.pop(); // Keep incomplete line
-
-                for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const jsonStr = line.replace("data: ", "").trim();
-                        if (!jsonStr) continue;
-
-                        try {
-                            const payload = JSON.parse(jsonStr);
-                            if (payload.type === "audio") {
-                                handleAudioChunk(payload);
-                            } else if (payload.type === "done") {
-                                isFinished = true;
-                                if (!isPlaying) startPlayback(); // Fallback if still buffering
-                            }
-                        } catch (e) {
-                            console.error("JSON parse error", e);
-                        }
-                    }
+                const { done, value } = await reader.read(); // value is Uint8Array (bytes)
+                if (done) {
+                    isFinished = true;
+                    break;
+                }
+                
+                if (value && value.length > 0) {
+                    handleBinaryChunk(value);
                 }
             }
         } catch (error) {
@@ -327,32 +262,30 @@
         }
     };
 
-    async function handleAudioChunk(payload) {
+    function handleBinaryChunk(uint8Array) {
         const now = performance.now();
-        const base64Data = payload.data;
         chunkCount++;
 
-        // Stats: first chunk latency
         if (chunkCount === 1) {
-            const ttft = (now - startTime).toFixed(0);
-            ttftEl.innerText = ttft;
+            ttftEl.innerText = (now - startTime).toFixed(0);
             lastChunkTime = now;
         } else {
-            const interval = now - lastChunkTime;
-            totalInterval += interval;
+            totalInterval += (now - lastChunkTime);
             lastChunkTime = now;
             avgIntervalEl.innerText = (totalInterval / (chunkCount - 1)).toFixed(0);
         }
         chunkCountEl.innerText = chunkCount;
 
-        // Add to buffer
-        chunkBuffer.push(base64Data);
-        bufferedCountEl.innerText = chunkBuffer.length;
-
-        // Start playback immediately when data is received
-        if (!isPlaying && (chunkBuffer.length >= 1 || isFinished)) {
-            startPlayback();
+        // Binary PCM16 (Int16) to WebAudio Float32
+        const int16Array = new Int16Array(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength / 2);
+        const float32Array = new Float32Array(int16Array.length);
+        for (let i = 0; i < int16Array.length; i++) {
+            float32Array[i] = int16Array[i] / 32768.0;
         }
+
+        chunkBuffer.push(float32Array);
+        bufferedCountEl.innerText = chunkBuffer.length;
+        if (!isPlaying) startPlayback();
     }
 
     async function startPlayback() {
@@ -361,30 +294,27 @@
         
         while (chunkBuffer.length > 0 || !isFinished) {
             if (chunkBuffer.length > 0) {
-                const base64Data = chunkBuffer.shift();
+                const float32Data = chunkBuffer.shift();
                 bufferedCountEl.innerText = chunkBuffer.length;
                 
-                try {
-                    const audioBuffer = await base64ToAudioBuffer(base64Data);
-                    const source = audioCtx.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(audioCtx.destination);
+                const audioBuffer = audioCtx.createBuffer(1, float32Data.length, 24000);
+                audioBuffer.getChannelData(0).set(float32Data);
+                
+                const source = audioCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioCtx.destination);
 
-                    const scheduledTime = Math.max(nextStartTime, audioCtx.currentTime);
-                    source.start(scheduledTime);
-                    nextStartTime = scheduledTime + audioBuffer.duration;
-                    
-                    statusText.innerText = `Playing...`;
-                } catch (e) {
-                    console.error("Playback error", e);
-                }
+                const scheduledTime = Math.max(nextStartTime, audioCtx.currentTime);
+                source.start(scheduledTime);
+                nextStartTime = scheduledTime + audioBuffer.duration;
+                
+                statusText.innerText = `Playing Binary...`;
             } else {
-                // Buffer empty but not finished, wait a bit
-                await new Promise(r => setTimeout(r, 50));
+                await new Promise(r => setTimeout(r, 20));
             }
         }
         
-        statusText.innerText = "Playback complete";
+        statusText.innerText = "Complete";
         indicator.classList.remove('active');
         isPlaying = false;
     }

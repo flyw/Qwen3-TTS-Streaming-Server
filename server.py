@@ -70,12 +70,10 @@ class TTSRequest(BaseModel):
     temperature: float = 0.5
     client_id: Optional[str] = Field(default="default", description="Unique ID for each client to maintain sequence")
 
-def audio_to_base64_wav(wav: np.ndarray, sr: int) -> str:
-    """Convert numpy array to standard WAV format encoded in Base64."""
-    buffer = io.BytesIO()
-    # Force PCM_16 to ensure stable byte count (2 bytes per sample)
-    sf.write(buffer, wav, sr, format='WAV', subtype='PCM_16')
-    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+def get_pcm_bytes(wav: np.ndarray) -> bytes:
+    """Convert float32 to int16 bytes for raw binary transfer."""
+    wav = np.clip(wav.flatten(), -1.0, 1.0)
+    return (wav * 32767).astype(np.int16).tobytes()
 
 # ================= Precision Sliding Window Streamer =================
 class AudioTokenStreamer(BaseStreamer):
@@ -97,8 +95,7 @@ class AudioTokenStreamer(BaseStreamer):
         self.skip_tokens = 0 
         self.actual_sent_count = 0
         self.pre_buffer_limit = pre_buffer
-        self.audio_buffer = [] # This now stores raw audio to be sent
-        self.pre_buffer_storage = []
+        self.pre_buffer_storage = [] # Stores pcm bytes
         
         self.upsample_rate = model_wrapper.model.speech_tokenizer.get_decode_upsample_rate()
         self.sample_rate = 24000
@@ -119,30 +116,22 @@ class AudioTokenStreamer(BaseStreamer):
         self.special_token_ids = {t_cfg.codec_bos_id, t_cfg.codec_eos_token_id, t_cfg.codec_pad_id}
 
     def _send_audio_packet(self, wav_chunk):
-        """Standard packet sending logic."""
+        """Send raw PCM bytes to queue."""
         if wav_chunk is None or len(wav_chunk) == 0: return
+        pcm_bytes = get_pcm_bytes(wav_chunk)
         try:
             if self.actual_sent_count < self.pre_buffer_limit:
-                self.pre_buffer_storage.append(wav_chunk)
+                self.pre_buffer_storage.append(pcm_bytes)
                 self.actual_sent_count += 1
                 if self.actual_sent_count == self.pre_buffer_limit:
-                    all_pre_wav = np.concatenate(self.pre_buffer_storage)
-                    audio_b64 = audio_to_base64_wav(all_pre_wav, self.sample_rate)
-                    self.loop.call_soon_threadsafe(
-                        self.queue.put_nowait, 
-                        {"type": "audio", "data": audio_b64, "index": 1, "is_prebuffered": True}
-                    )
+                    all_pre_bytes = b"".join(self.pre_buffer_storage)
+                    self.loop.call_soon_threadsafe(self.queue.put_nowait, all_pre_bytes)
                     self.pre_buffer_storage = []
                 return
 
-            audio_b64 = audio_to_base64_wav(wav_chunk, self.sample_rate)
-            self.actual_sent_count += 1
-            self.loop.call_soon_threadsafe(
-                self.queue.put_nowait, 
-                {"type": "audio", "data": audio_b64, "index": self.actual_sent_count}
-            )
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, pcm_bytes)
         except Exception as e:
-            logger.error(f"Error sending audio packet: {e}")
+            logger.error(f"Error sending pcm packet: {e}")
 
     def _decode_batch(self):
         """The core optimization: Decode multiple tokens in a single model forward pass."""
@@ -214,12 +203,8 @@ class AudioTokenStreamer(BaseStreamer):
         
         if self.pre_buffer_storage:
             try:
-                all_pre_wav = np.concatenate(self.pre_buffer_storage)
-                audio_b64 = audio_to_base64_wav(all_pre_wav, self.sample_rate)
-                self.loop.call_soon_threadsafe(
-                    self.queue.put_nowait, 
-                    {"type": "audio", "data": audio_b64, "index": 1, "is_prebuffered": True}
-                )
+                all_pre_bytes = b"".join(self.pre_buffer_storage)
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, all_pre_bytes)
                 self.pre_buffer_storage = []
             except: pass
 
@@ -229,7 +214,8 @@ class AudioTokenStreamer(BaseStreamer):
                 filename = f"precision_stream_{int(time.time())}.wav"
                 sf.write(filename, full_audio, self.sample_rate)
             except: pass
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, {"type": "done"})
+        # Use None to signal end of binary stream
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, None)
 
 # ================= Server Logic =================
 def global_forward_hook(module, input, output):
@@ -306,7 +292,7 @@ def load_model():
 
     logger.info("Server is Parallel-Ready.")
 
-async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None]:
+async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, None]:
     # Acquire lock specific to this client_id to maintain sequence for each user
     async with client_locks[request.client_id]:
         # Standard space padding
@@ -351,27 +337,22 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
                 
             except Exception as e:
                 logger.error(f"Inference Thread Error: {e}")
-                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "message": str(e)})
             finally:
                 active_streamer.reset(token)
-                loop.call_soon_threadsafe(queue.put_nowait, {"type": "done"})
+                loop.call_soon_threadsafe(queue.put_nowait, None)
 
         # Run in a separate thread but maintain context propagation
         asyncio.create_task(asyncio.to_thread(run_inference))
         
-        yield f"data: {json.dumps({'type': 'start'})}\n\n"
-        
         while True:
             item = await queue.get()
-            if item["type"] == "done":
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                break
-            yield f"data: {json.dumps(item)}\n\n"
+            if item is None: break
+            yield item
 
 @app.post("/tts/stream")
 async def tts_stream(request: TTSRequest):
     logger.info(f"Received request (ClientID: {request.client_id}): {request.text[:20]}...")
-    return StreamingResponse(generate_token_stream(request), media_type="text/event-stream")
+    return StreamingResponse(generate_token_stream(request), media_type="audio/l16;rate=24000")
 
 @app.get("/health")
 async def health(): return {"status": "ready"}
