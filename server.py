@@ -29,6 +29,10 @@ from collections import defaultdict
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Qwen3-TTS")
 
+# [Optimization 1]: Enable TF32 Hardware Acceleration
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # Storage for per-client locks to ensure serial processing for each user while allowing cross-user parallelism
 client_locks = defaultdict(asyncio.Lock)
 
@@ -40,12 +44,20 @@ REF_AUDIO_PATH = os.getenv("REF_AUDIO_PATH", None)
 PORT = int(os.getenv("PORT", "9000"))
 HOST = os.getenv("HOST", "0.0.0.0")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+# [Optimization 2]: Dynamic DTYPE Selection
+if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
+    DTYPE = torch.bfloat16
+    logger.info("Performance mode: Using Bfloat16")
+else:
+    DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+    logger.info(f"Performance mode: Using {DTYPE}")
 
 model_wrapper = None
 default_voice_prompt = None
 GLOBAL_SAVE_ENABLED = False 
 GLOBAL_CHUNK_SIZE = 1
+GLOBAL_PRE_BUFFER = 0
 
 app = FastAPI(title="Qwen3-TTS Thread-Safe Parallel Server")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -56,8 +68,6 @@ class TTSRequest(BaseModel):
     ref_audio: Optional[str] = None
     max_new_tokens: int = 2048
     temperature: float = 0.5
-    chunk_size: Optional[int] = Field(default=None, description="Number of tokens to buffer before sending")
-    pre_buffer: int = Field(default=0, description="Number of chunks to buffer on server before sending the first packet")
     client_id: Optional[str] = Field(default="default", description="Unique ID for each client to maintain sequence")
 
 def audio_to_base64_wav(wav: np.ndarray, sr: int) -> str:
@@ -73,36 +83,34 @@ class AudioTokenStreamer(BaseStreamer):
     Handles real-time audio token streaming with a sliding window approach
     to maintain audio continuity and minimize latency.
     """
-    def __init__(self, model_wrapper, queue, loop, voice_prompt=None, save_enabled=False, chunk_size=5, pre_buffer=0):
+    def __init__(self, model_wrapper, queue, loop, voice_prompt=None, save_enabled=False, chunk_size=1, pre_buffer=0):
         self.model_wrapper = model_wrapper
         self.queue = queue
         self.loop = loop
         self.token_count = 0
         self.start_time = None
         
-        # No need to skip tokens in X-Vector mode
+        # [Optimization]: Batch decoding buffer
+        self.chunk_size = max(1, chunk_size)
+        self.pending_tokens = [] 
+        
         self.skip_tokens = 0 
         self.actual_sent_count = 0
-        
-        # Buffering for network stability
-        self.chunk_size = chunk_size
         self.pre_buffer_limit = pre_buffer
-        self.audio_buffer = []
-        self.pre_buffer_storage = [] # To store chunks during pre-buffering phase
-        self.last_sent_index = 0
+        self.audio_buffer = [] # This now stores raw audio to be sent
+        self.pre_buffer_storage = []
         
-        # Get dynamic upsample rate (typically 2000 for 12Hz models)
         self.upsample_rate = model_wrapper.model.speech_tokenizer.get_decode_upsample_rate()
-        self.sample_rate = 24000 # Default for Qwen3-TTS
+        self.sample_rate = 24000
         
-        # Reference audio context
         self.ref_code = None
         if voice_prompt and len(voice_prompt) > 0 and voice_prompt[0].ref_code is not None:
-            self.ref_code = voice_prompt[0].ref_code.cpu().view(-1, 16)
+            # Keep on GPU if possible for faster concatenation
+            self.ref_code = voice_prompt[0].ref_code.view(-1, 16)
             
         self.all_tokens_history = [] 
-        self.context_window = 12 # Maintain 1-second sliding window
-        self.last_total_samples = 0 # Global counter for decoded samples
+        self.context_window = 12
+        self.last_total_samples = 0
         
         self.save_enabled = save_enabled
         self.final_audio_segments = []
@@ -110,114 +118,100 @@ class AudioTokenStreamer(BaseStreamer):
         t_cfg = model_wrapper.model.config.talker_config
         self.special_token_ids = {t_cfg.codec_bos_id, t_cfg.codec_eos_token_id, t_cfg.codec_pad_id}
 
-    def flush_buffer(self):
-        """Merge buffered audio chunks and send them as a single network packet."""
-        if not self.audio_buffer:
-            return
-
+    def _send_audio_packet(self, wav_chunk):
+        """Standard packet sending logic."""
+        if wav_chunk is None or len(wav_chunk) == 0: return
         try:
-            combined_wav = np.concatenate(self.audio_buffer)
-            self.audio_buffer = []
-
-            # Server-side Pre-buffering logic
             if self.actual_sent_count < self.pre_buffer_limit:
-                self.pre_buffer_storage.append(combined_wav)
+                self.pre_buffer_storage.append(wav_chunk)
                 self.actual_sent_count += 1
-                
-                # If we just hit the limit, send all buffered chunks at once
                 if self.actual_sent_count == self.pre_buffer_limit:
                     all_pre_wav = np.concatenate(self.pre_buffer_storage)
                     audio_b64 = audio_to_base64_wav(all_pre_wav, self.sample_rate)
                     self.loop.call_soon_threadsafe(
                         self.queue.put_nowait, 
-                        {
-                            "type": "audio", 
-                            "data": audio_b64, 
-                            "index": 1, 
-                            "is_prebuffered": True,
-                            "chunk_len": len(self.pre_buffer_storage)
-                        }
+                        {"type": "audio", "data": audio_b64, "index": 1, "is_prebuffered": True}
                     )
                     self.pre_buffer_storage = []
                 return
 
-            # Normal streaming phase
-            audio_b64 = audio_to_base64_wav(combined_wav, self.sample_rate)
+            audio_b64 = audio_to_base64_wav(wav_chunk, self.sample_rate)
             self.actual_sent_count += 1
             self.loop.call_soon_threadsafe(
                 self.queue.put_nowait, 
-                {
-                    "type": "audio", 
-                    "data": audio_b64, 
-                    "index": self.actual_sent_count, 
-                    "chunk_len": 1
-                }
+                {"type": "audio", "data": audio_b64, "index": self.actual_sent_count}
             )
         except Exception as e:
-            logger.error(f"Error flushing audio buffer: {e}")
+            logger.error(f"Error sending audio packet: {e}")
+
+    def _decode_batch(self):
+        """The core optimization: Decode multiple tokens in a single model forward pass."""
+        if not self.pending_tokens: return
+        
+        num_new_tokens = len(self.pending_tokens)
+        self.pending_tokens = []
+        effective_token_count = self.token_count - self.skip_tokens
+        
+        try:
+            with torch.no_grad():
+                # 1. Sliding window with Batch Support
+                history_segment = self.all_tokens_history[-(self.context_window + num_new_tokens):]
+                
+                if len(self.all_tokens_history) <= self.context_window and self.ref_code is not None:
+                    needed_ref = self.context_window - len(self.all_tokens_history) + num_new_tokens
+                    ref_segment = self.ref_code[-needed_ref:]
+                    decode_input = torch.cat([ref_segment] + history_segment, dim=0)
+                else:
+                    decode_input = torch.cat(history_segment, dim=0)
+
+                # 2. Single Decode call for multiple tokens
+                wavs, sr = self.model_wrapper.model.speech_tokenizer.decode([{"audio_codes": decode_input}])
+                window_wav = wavs[0]
+                self.sample_rate = sr
+                
+                # 3. Precisely extract audio for the entire batch
+                current_total_samples = effective_token_count * self.upsample_rate
+                num_to_extract = current_total_samples - self.last_total_samples
+                new_audio_chunk = window_wav[-num_to_extract:]
+                self.last_total_samples = current_total_samples
+                
+                # 4. First packet fade-in
+                if effective_token_count <= num_new_tokens:
+                    fade_len = min(1000, len(new_audio_chunk))
+                    new_audio_chunk[:fade_len] *= np.linspace(0, 1, fade_len)
+
+                if self.save_enabled:
+                    self.final_audio_segments.append(new_audio_chunk)
+                
+                self._send_audio_packet(new_audio_chunk)
+                    
+        except Exception as e:
+            logger.error(f"Batch decode error: {e}")
 
     def handle_forward_token(self, codec_ids):
         if self.start_time is None:
             self.start_time = time.time()
 
         token_id = int(codec_ids.view(-1)[0])
-        if token_id in self.special_token_ids:
-            return
+        if token_id in self.special_token_ids: return
 
         self.token_count += 1
-        
-        # Strategy: Hard Skip first N tokens to eliminate prompt leakage
-        if self.token_count <= self.skip_tokens:
-            return
+        if self.token_count <= self.skip_tokens: return
 
-        # Adjust token_count for logic hereafter (start from 1 after skip)
-        effective_token_count = self.token_count - self.skip_tokens
-        
-        new_token = codec_ids.cpu().view(1, 16)
+        # 1. Accumulate tokens
+        new_token = codec_ids.view(1, 16)
         self.all_tokens_history.append(new_token)
+        self.pending_tokens.append(new_token)
         
-        try:
-            with torch.no_grad():
-                # 1. Construct sliding window input
-                history_segment = self.all_tokens_history[-(self.context_window + 1):]
-                
-                if len(self.all_tokens_history) <= self.context_window and self.ref_code is not None:
-                    needed_ref = self.context_window - len(self.all_tokens_history) + 1
-                    ref_segment = self.ref_code[-needed_ref:]
-                    decode_input = torch.cat([ref_segment] + history_segment, dim=0)
-                else:
-                    decode_input = torch.cat(history_segment, dim=0)
-
-                # 2. Decode the current window
-                wavs, sr = self.model_wrapper.model.speech_tokenizer.decode([{"audio_codes": decode_input}])
-                window_wav = wavs[0]
-                self.sample_rate = sr
-                
-                # 3. Precisely calculate incremental samples
-                # We track samples based on effective_token_count
-                current_total_samples = effective_token_count * self.upsample_rate
-                num_to_extract = current_total_samples - self.last_total_samples
-                new_audio_chunk = window_wav[-num_to_extract:]
-                self.last_total_samples = current_total_samples
-                
-                # 4. Edge smoothing (applied to the first non-skipped token)
-                if effective_token_count == 1:
-                    new_audio_chunk[:1000] *= np.linspace(0, 1, 1000)
-
-                if self.save_enabled:
-                    self.final_audio_segments.append(new_audio_chunk)
-                
-                # 5. Buffering logic
-                self.audio_buffer.append(new_audio_chunk)
-                if len(self.audio_buffer) >= self.chunk_size:
-                    self.flush_buffer()
-                    
-        except Exception as e:
-            logger.error(f"Precision decode error: {e}")
+        # 2. Trigger decode: either hit chunk_size, or it's the very first token (to keep TTFT low)
+        if len(self.pending_tokens) >= self.chunk_size or (self.token_count - self.skip_tokens) == 1:
+            self._decode_batch()
 
     def put(self, value): pass
     def end(self):
-        # If we finished before hitting pre_buffer_limit, flush whatever we have
+        # Flush remaining tokens
+        self._decode_batch()
+        
         if self.pre_buffer_storage:
             try:
                 all_pre_wav = np.concatenate(self.pre_buffer_storage)
@@ -229,17 +223,12 @@ class AudioTokenStreamer(BaseStreamer):
                 self.pre_buffer_storage = []
             except: pass
 
-        # Ensure remaining audio in buffer is sent
-        self.flush_buffer()
-        
         if self.save_enabled and self.final_audio_segments:
             try:
                 full_audio = np.concatenate(self.final_audio_segments)
                 filename = f"precision_stream_{int(time.time())}.wav"
                 sf.write(filename, full_audio, self.sample_rate)
-                print(f"DEBUG: [Audio saved successfully] -> {filename}")
-            except Exception as e:
-                logger.error(f"Failed to save audio: {e}")
+            except: pass
         self.loop.call_soon_threadsafe(self.queue.put_nowait, {"type": "done"})
 
 # ================= Server Logic =================
@@ -258,12 +247,28 @@ def load_model():
     global model_wrapper, default_voice_prompt
     logger.info(f"Loading Qwen3-TTS and preparing thread-safe environment...")
     
+    # Global gradient disabling
+    torch.set_grad_enabled(False)
+    
     model_wrapper = Qwen3TTSModel.from_pretrained(
         MODEL_PATH, 
         device_map=DEVICE, 
         dtype=DTYPE
     )
     
+    # [Optimization 3]: Selective Torch Compile
+    # We compile the speech_tokenizer (VQ decoder) which is compute-heavy 
+    # but keep the talker uncompiled to ensure Forward Hooks work correctly.
+    if hasattr(torch, 'compile') and DEVICE == "cuda":
+        logger.info("Compiling speech_tokenizer for faster audio decoding...")
+        try:
+            model_wrapper.model.speech_tokenizer.model = torch.compile(
+                model_wrapper.model.speech_tokenizer.model, 
+                mode="reduce-overhead"
+            )
+        except Exception as e:
+            logger.warning(f"torch.compile for tokenizer failed: {e}")
+
     # 1. Global Monkey Patch: inject the context-aware streamer into the generate call
     original_talker_generate = model_wrapper.model.talker.generate
     def thread_safe_generate(*args, **kwargs):
@@ -287,6 +292,18 @@ def load_model():
             ref_text=None,
             x_vector_only_mode=True
         )
+
+    # [Optimization 4]: Pre-warmup
+    if DEVICE == "cuda":
+        logger.info("Warming up CUDA kernels...")
+        with torch.inference_mode():
+            model_wrapper.generate_voice_clone(
+                text="Warmup.", 
+                voice_clone_prompt=default_voice_prompt, 
+                max_new_tokens=24
+            )
+        logger.info("Warmup complete.")
+
     logger.info("Server is Parallel-Ready.")
 
 async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None]:
@@ -297,7 +314,6 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
         
         queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
-        active_chunk_size = request.chunk_size if request.chunk_size is not None else GLOBAL_CHUNK_SIZE
         
         streamer = AudioTokenStreamer(
             model_wrapper, 
@@ -305,20 +321,34 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
             loop, 
             voice_prompt=default_voice_prompt, 
             save_enabled=GLOBAL_SAVE_ENABLED,
-            chunk_size=active_chunk_size,
-            pre_buffer=request.pre_buffer
+            chunk_size=GLOBAL_CHUNK_SIZE,
+            pre_buffer=GLOBAL_PRE_BUFFER
         )
 
         def run_inference():
             # Set the context for this specific thread
             token = active_streamer.set(streamer)
+            inf_start = time.time()
             try:
                 model_wrapper.generate_voice_clone(
                     text=clean_text, 
-                    voice_clone_prompt=default_voice_prompt,
+                    voice_clone_prompt=default_voice_prompt, # <--- 修正回正确的参数名
+                    language=request.language,
                     max_new_tokens=request.max_new_tokens,
                     temperature=request.temperature
                 )
+                inf_end = time.time()
+                inf_dur = inf_end - inf_start
+                
+                # Calculate precise audio duration from token count
+                audio_dur = (streamer.token_count * streamer.upsample_rate) / streamer.sample_rate
+                rtf = inf_dur / audio_dur if audio_dur > 0 else 0
+                
+                logger.info("-" * 30)
+                logger.info(f"PROCESSED: \"{clean_text.strip()[:30]}...\"")
+                logger.info(f"METRICS:   Inference: {inf_dur:.2f}s | Audio: {audio_dur:.2f}s | RTF: {rtf:.4f}")
+                logger.info("-" * 30)
+                
             except Exception as e:
                 logger.error(f"Inference Thread Error: {e}")
                 loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "message": str(e)})
@@ -340,7 +370,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[str, None
 
 @app.post("/tts/stream")
 async def tts_stream(request: TTSRequest):
-    logger.info(f"Received request (ClientID: {request.client_id}, ChunkSize: {request.chunk_size}, PreBuffer: {request.pre_buffer}): {request.text[:20]}...")
+    logger.info(f"Received request (ClientID: {request.client_id}): {request.text[:20]}...")
     return StreamingResponse(generate_token_stream(request), media_type="text/event-stream")
 
 @app.get("/health")
@@ -349,27 +379,29 @@ async def health(): return {"status": "ready"}
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen3-TTS Precision Streaming Server")
     parser.add_argument("--save", action="store_true", help="Enable global saving of audio segments")
-    parser.add_argument("--ref-audio-file", type=str, required=True, help="Path to reference audio file (required)")
+    parser.add_argument("--ref-audio", type=str, required=True, help="Path to reference audio file (required)")
     parser.add_argument("--model-path", type=str, default=MODEL_PATH, help="Path to the model directory")
     parser.add_argument("--host", type=str, default=HOST, help="Host to bind the server to")
     parser.add_argument("--port", type=int, default=PORT, help="Port to bind the server to")
     parser.add_argument("--chunk-size", type=int, default=1, help="Default tokens to buffer before sending")
+    parser.add_argument("--pre-buffer", type=int, default=0, help="Number of chunks to buffer on server before sending")
 
     args = parser.parse_args()
 
     GLOBAL_SAVE_ENABLED = args.save
 
-    if not os.path.exists(args.ref_audio_file):
-        logger.error(f"Reference audio file not found: {args.ref_audio_file}")
-        logger.error("Please provide a valid reference audio file using --ref-audio-file")
+    if not os.path.exists(args.ref_audio):
+        logger.error(f"Reference audio file not found: {args.ref_audio}")
+        logger.error("Please provide a valid reference audio file using --ref-audio")
         exit(1)
 
-    REF_AUDIO_PATH = args.ref_audio_file
+    REF_AUDIO_PATH = args.ref_audio
     logger.info(f"Using reference audio from: {REF_AUDIO_PATH}")
             
     MODEL_PATH = args.model_path
     HOST = args.host
     PORT = args.port
     GLOBAL_CHUNK_SIZE = args.chunk_size
+    GLOBAL_PRE_BUFFER = args.pre_buffer
     
     uvicorn.run(app, host=HOST, port=PORT)

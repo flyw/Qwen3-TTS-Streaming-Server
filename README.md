@@ -73,9 +73,10 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./Qwen3-TT
 # You only need the reference audio file. No transcript required.
 python server.py \
   --model-path ./Qwen3-TTS-12Hz-1.7B-Base \
-  --ref-audio-file reference.wav \
+  --ref-audio reference.wav \
   --port 9000 \
-  --chunk-size 1
+  --chunk-size 6 \
+  --pre-buffer 2
 ```
 
 ---
@@ -91,18 +92,17 @@ python server.py \
   "text": "Hello world.",
   "language": "English",
   "temperature": 0.5,
-  "chunk_size": 5,
-  "pre_buffer": 3,
   "client_id": "user_123"
 }
 ```
-*   **chunk_size**: Number of tokens to buffer before sending a single SSE packet. (e.g., 12 tokens $\approx$ 1s of audio for 12Hz models).
-*   **pre_buffer**: Number of initial chunks to buffer on the server before sending the very first data packet. This creates a "head start" for the player to prevent stuttering under load.
+*   **text**: The text to synthesize.
+*   **language**: Target language (Chinese, English, Japanese, Korean, Cantonese).
+*   **temperature**: Controls expressiveness (0.1 to 1.0).
 *   **client_id**: Unique ID per user. Requests with the same ID are processed **sequentially**, while different IDs are processed **in parallel**.
 
 **Response**: A `text/event-stream` returning JSON chunks:
-- `{"type": "start"}`: Signals the start of generation.
-- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1, "is_prebuffered": true}`: Audio data chunk.
+- `{"type": "start", "total_chunks": 1}`: Signals the start of generation.
+- `{"type": "audio", "data": "BASE64_WAV_CHUNK", "index": 1}`: Audio data chunk.
 - `{"type": "done"}`: Signals completion.
 
 ---
@@ -112,27 +112,25 @@ python server.py \
 | CLI Argument | Environment Variable | Default | Description |
 |--------------|----------------------|---------|-------------|
 | `--model-path` | `MODEL_PATH` | `./Qwen3-TTS-12Hz-1.7B-Base` | Path to model weights |
-| `--ref-audio-file` | `REF_AUDIO_PATH` | `None` | Path to reference audio for cloning (Required) |
+| `--ref-audio` | `REF_AUDIO_PATH` | `None` | Path to reference audio for cloning (Required) |
 | `--host` | `HOST` | `0.0.0.0` | Server host |
 | `--port` | `PORT` | `9000` | Server port |
-| `--chunk-size` | *None* | `1` | Global default for tokens to buffer before sending |
-| `pre_buffer` | *API Only* | `0` | Initial chunks to buffer on server for the first packet |
+| `--chunk-size` | *None* | `1` | Global tokens to buffer before decoding/sending (Higher = better RTF) |
+| `--pre-buffer` | *None* | `0` | Number of chunks to buffer on server before sending the first packet |
 | `client_id` | *API Only* | `"default"` | Unique ID per user to enable parallel processing |
 
 ---
 
 ## WebUI Testing
 
-A ready-to-use HTML client (`webui.html`) is included to test the streaming API. It features a high-performance **Anti-Jitter Buffer** implementation.
+A ready-to-use HTML client (`webui.html`) is included to test the streaming API.
 
 1. Start the server (e.g., on port 9000).
 2. Open `webui.html` in any modern web browser.
 3. Configure your **Server URL** and **Client ID**.
-4. **Optimization Settings**:
-    - **Chunk Size**: Adjust how many tokens are in each network packet. Increase this (e.g., to 10-15) for better efficiency on high-latency networks.
-    - **Pre-buffer**: Set the initial buffer depth. If you experience stuttering (RTF < 1.2), set this to 3 or 4.
+4. Adjust **Language** and **Temperature** as needed.
 5. Click **Play** to start synthesis. 
-6. Observe the **Buffered** count in the stats board. If it drops to 0 during playback, increase your `Pre-buffer`.
+6. Observe the **Buffered** count in the stats board.
 
 ---
 
@@ -140,115 +138,52 @@ A ready-to-use HTML client (`webui.html`) is included to test the streaming API.
 
 ## Client Integration Guide
 
-Integrating a streaming TTS requires handling **Server-Sent Events (SSE)** and managing an **Audio Jitter Buffer** to ensure gapless playback.
-
 ### 1. High-Level Architecture
-1.  **Request**: Send a `POST` request to `/tts/stream` with `stream: true`.
-2.  **Stream Consumption**: Use `fetch` and `ReadableStream` (since standard `EventSource` doesn't support POST).
+1.  **Request**: Send a `POST` request to `/tts/stream`.
+2.  **Stream Consumption**: Use `fetch` and `ReadableStream`.
 3.  **Decoding**: Decode Base64-encoded WAV chunks into `AudioBuffer`.
-4.  **Scheduling**: Use the Web Audio API to schedule each chunk at a precise `startTime` to avoid clicks or gaps.
+4.  **Scheduling**: Use the Web Audio API to schedule each chunk.
 
 ### 2. Complete JavaScript Implementation
 
 ```javascript
-class Qwen3TTSPlayer {
-    constructor(sampleRate = 24000) {
-        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
-        this.nextStartTime = 0; // Tracks the end time of the last scheduled chunk
-        this.isPlaying = false;
-    }
+async function speak(text, options = {}) {
+    const response = await fetch('http://localhost:9000/tts/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            text,
+            language: "Chinese",
+            temperature: 0.5,
+            ...options
+        })
+    });
 
-    /**
-     * Synthesize and play text
-     * @param {string} text - Text to speak
-     * @param {Object} options - API options (chunk_size, pre_buffer, etc.)
-     */
-    async speak(text, options = {}) {
-        // Ensure AudioContext is active (browsers block audio until user interaction)
-        if (this.audioCtx.state === 'suspended') await this.audioCtx.resume();
-        
-        // Reset timing for a new sentence
-        this.nextStartTime = this.audioCtx.currentTime;
-        this.isPlaying = true;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-        try {
-            const response = await fetch('http://localhost:9000/tts/stream', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    text,
-                    language: "Chinese",
-                    chunk_size: 5,
-                    pre_buffer: 3,
-                    stream: true,
-                    ...options
-                })
-            });
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop();
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
+        for (const line of lines) {
+            if (line.startsWith("data: ")) {
+                const jsonStr = line.replace("data: ", "").trim();
+                const payload = JSON.parse(jsonStr);
 
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n\n");
-                buffer = lines.pop(); // Keep incomplete JSON line
-
-                for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const jsonStr = line.replace("data: ", "").trim();
-                        const payload = JSON.parse(jsonStr);
-
-                        if (payload.type === "audio") {
-                            await this.schedulePlayback(payload.data);
-                        } else if (payload.type === "done") {
-                            console.log("Stream finished");
-                        }
-                    }
+                if (payload.type === "audio") {
+                    // Convert Base64 to ArrayBuffer and play using Web Audio API
+                    await playChunk(payload.data);
                 }
             }
-        } catch (err) {
-            console.error("Playback Error:", err);
-        } finally {
-            this.isPlaying = false;
         }
     }
-
-    /**
-     * Decodes Base64 to AudioBuffer and schedules it in the Web Audio timeline
-     */
-    async schedulePlayback(base64Data) {
-        // Convert Base64 to ArrayBuffer
-        const binary = atob(base64Data);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        
-        // Decode audio data
-        const audioBuffer = await this.audioCtx.decodeAudioData(bytes.buffer);
-        
-        // Create BufferSource
-        const source = this.audioCtx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(this.audioCtx.destination);
-
-        // Calculate start time: 
-        // We use either the current time or the end of the previous chunk, whichever is later.
-        const now = this.audioCtx.currentTime;
-        const startTime = Math.max(now, this.nextStartTime);
-        
-        source.start(startTime);
-
-        // Update the timeline
-        this.nextStartTime = startTime + audioBuffer.duration;
-    }
 }
-
-// Usage:
-// const player = new Qwen3TTSPlayer();
-// player.speak("欢迎使用通义千问语音大模型。");
 ```
 
 ### 3. Key Optimization Tips
