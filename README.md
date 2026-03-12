@@ -14,6 +14,8 @@
 
 ### What's New in This Fork?
 - **Extreme Performance Optimization**: Utilizes a specialized monkey-patching technique to intercept model forward passes, enabling the delivery of the first audio chunk almost instantly.
+- **Smart Queue Management**: Multiple requests from the same `client_id` (e.g., from an LLM stream) are automatically queued and processed in order, ensuring a seamless multi-sentence speaking experience.
+- **On-Demand Interruption**: New `/tts/interrupt` endpoint allows users to stop the current speech and **automatically flush all queued requests**, perfect for handling user interruptions in voice chat.
 - **High-Performance FastAPI Server**: Optimized for concurrent requests and low-latency throughput.
 - **Raw Binary Streaming**: Replaced SSE/Base64 with raw **PCM 16-bit** binary streaming, reducing bandwidth overhead by **~33%** and lowering client-side CPU usage.
 - **Sliding Window Audio Reconstruction**: An advanced algorithm ensures seamless audio stitching and high-quality output during streaming.
@@ -97,8 +99,18 @@ python server.py \
 ```
 
 **Response**: `audio/l16;rate=24000`
-- The server returns a continuous stream of raw **PCM 16-bit (Little Endian), Mono, 24,000Hz** bytes.
-- There is no JSON wrapping or Base64 encoding. Every byte is actual audio data.
+- Returns a raw **PCM 16-bit, 24,000Hz** byte stream.
+- **Queuing**: Multiple requests with the same `client_id` will queue up and play sequentially (ideal for LLM streaming outputs).
+
+### Interrupt & Flush Queue
+**Endpoint**: `POST /tts/interrupt`
+
+**Query Parameters**:
+- `client_id` (Optional, default: `"default"`): The ID of the client to interrupt.
+
+**Action**: 
+1. Immediately stops the current inference for the specified client.
+2. **Flushes the queue**: All other requests for this `client_id` that are currently waiting will be discarded, allowing new speech to start instantly.
 
 ---
 
@@ -180,10 +192,37 @@ async function speakBinary(text) {
 }
 ```
 
-### 3. Key Optimization Tips
-- **Binary Conversion**: Using `Int16Array` view on the `Uint8Array.buffer` is extremely fast and avoids manual byte shifting.
-- **Sample Rate**: Ensure your `AudioContext` is locked to **24000Hz** to match the server output and avoid browser-side resampling.
-- **No SSE Overhead**: Since there's no JSON parsing, you can process packets of any size immediately as they arrive.
+### 4. Handling Interruption (Stop-to-Talk)
+To implement a "Stop-to-Talk" feature (e.g., when a user interrupts the AI), the client must do two things:
+1.  **Call the server interrupt API**: This stops the server-side inference and flushes the queue.
+2.  **Clear local audio context**: Immediately stop the browser's audio playback.
+
+```javascript
+// Global state for playback control
+let audioCtx = new AudioContext({ sampleRate: 24000 });
+let activeSources = [];
+
+async function interrupt(clientId = "default") {
+    // 1. Tell the server to stop and flush the queue
+    await fetch(`http://localhost:9000/tts/interrupt?client_id=${clientId}`, { method: 'POST' });
+
+    // 2. Stop all currently scheduled audio chunks in the browser
+    activeSources.forEach(source => {
+        try { source.stop(); } catch(e) {}
+    });
+    activeSources = [];
+    
+    // 3. Reset the playback timer
+    nextStartTime = audioCtx.currentTime;
+}
+
+// During playback, keep track of sources:
+const source = audioCtx.createBufferSource();
+source.buffer = buffer;
+source.connect(audioCtx.destination);
+source.start(startTime);
+activeSources.push(source); // Track this source to stop it later if needed
+```
 
 ---
 
