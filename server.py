@@ -7,7 +7,7 @@ import json
 import threading
 import asyncio
 import argparse
-from typing import Optional, List, AsyncGenerator
+from typing import Optional, List, AsyncGenerator, Dict
 import tempfile
 
 import torch
@@ -35,6 +35,10 @@ torch.backends.cudnn.allow_tf32 = True
 
 # Storage for per-client locks to ensure serial processing for each user while allowing cross-user parallelism
 client_locks = defaultdict(asyncio.Lock)
+# Track the stop_event of the active task for each client to allow proactive interruption
+active_stop_events: Dict[str, threading.Event] = {}
+# Counter to track interrupt events for flushing the queue
+interrupt_counters = defaultdict(int)
 
 # Context variable to route tokens to the correct request-specific streamer in a thread-safe way
 active_streamer: contextvars.ContextVar[Optional[BaseStreamer]] = contextvars.ContextVar("active_streamer", default=None)
@@ -81,12 +85,13 @@ class AudioTokenStreamer(BaseStreamer):
     Handles real-time audio token streaming with a sliding window approach
     to maintain audio continuity and minimize latency.
     """
-    def __init__(self, model_wrapper, queue, loop, voice_prompt=None, save_enabled=False, chunk_size=1, pre_buffer=0):
+    def __init__(self, model_wrapper, queue, loop, voice_prompt=None, save_enabled=False, chunk_size=1, pre_buffer=0, stop_event=None):
         self.model_wrapper = model_wrapper
         self.queue = queue
         self.loop = loop
         self.token_count = 0
         self.start_time = None
+        self.stop_event = stop_event
         
         # [Optimization]: Batch decoding buffer
         self.chunk_size = max(1, chunk_size)
@@ -178,6 +183,10 @@ class AudioTokenStreamer(BaseStreamer):
             logger.error(f"Batch decode error: {e}")
 
     def handle_forward_token(self, codec_ids):
+        # [INTERRUPTION]: Raise error to stop generate() immediately if client disconnected
+        if self.stop_event and self.stop_event.is_set():
+            raise InterruptedError("Client disconnected, stopping inference.")
+
         if self.start_time is None:
             self.start_time = time.time()
 
@@ -293,13 +302,26 @@ def load_model():
     logger.info("Server is Parallel-Ready.")
 
 async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, None]:
+    # Record the interrupt version at the moment the request arrived
+    my_interrupt_version = interrupt_counters[request.client_id]
+
     # Acquire lock specific to this client_id to maintain sequence for each user
+    # Multiple sentences from the same LLM stream will queue up here.
     async with client_locks[request.client_id]:
+        # [NEW]: Check if an interrupt happened while we were waiting in the queue
+        if interrupt_counters[request.client_id] > my_interrupt_version:
+            logger.info(f"FLUSHING queued request for ClientID: {request.client_id} due to previous interrupt call.")
+            return
+
         # Standard space padding
         clean_text = " " + request.text.strip()
         
         queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
+        stop_event = threading.Event()
+        
+        # Register the new stop_event as the active one for this client
+        active_stop_events[request.client_id] = stop_event
         
         streamer = AudioTokenStreamer(
             model_wrapper, 
@@ -308,7 +330,8 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
             voice_prompt=default_voice_prompt, 
             save_enabled=GLOBAL_SAVE_ENABLED,
             chunk_size=GLOBAL_CHUNK_SIZE,
-            pre_buffer=GLOBAL_PRE_BUFFER
+            pre_buffer=GLOBAL_PRE_BUFFER,
+            stop_event=stop_event
         )
 
         def run_inference():
@@ -318,7 +341,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
             try:
                 model_wrapper.generate_voice_clone(
                     text=clean_text, 
-                    voice_clone_prompt=default_voice_prompt, # <--- 修正回正确的参数名
+                    voice_clone_prompt=default_voice_prompt,
                     language=request.language,
                     max_new_tokens=request.max_new_tokens,
                     temperature=request.temperature
@@ -335,6 +358,8 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
                 logger.info(f"METRICS:   Inference: {inf_dur:.2f}s | Audio: {audio_dur:.2f}s | RTF: {rtf:.4f}")
                 logger.info("-" * 30)
                 
+            except InterruptedError:
+                logger.info(f"Interrupted: Request cancelled/preempted (ClientID: {request.client_id})")
             except Exception as e:
                 logger.error(f"Inference Thread Error: {e}")
             finally:
@@ -342,17 +367,37 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
         # Run in a separate thread but maintain context propagation
-        asyncio.create_task(asyncio.to_thread(run_inference))
+        inf_task = asyncio.create_task(asyncio.to_thread(run_inference))
         
-        while True:
-            item = await queue.get()
-            if item is None: break
-            yield item
+        try:
+            while True:
+                item = await queue.get()
+                if item is None: break
+                yield item
+        finally:
+            # Signal the thread to stop and wait for it to finish before releasing lock
+            stop_event.set()
+            # Clean up the global tracker only if it's still OUR event
+            if active_stop_events.get(request.client_id) == stop_event:
+                active_stop_events.pop(request.client_id, None)
+            await inf_task
 
 @app.post("/tts/stream")
 async def tts_stream(request: TTSRequest):
     logger.info(f"Received request (ClientID: {request.client_id}): {request.text[:20]}...")
     return StreamingResponse(generate_token_stream(request), media_type="audio/l16;rate=24000")
+
+@app.post("/tts/interrupt")
+async def interrupt_client(client_id: str = "default"):
+    """Explicitly interrupt the active task and clear all queued tasks for a specific client."""
+    # Increment counter to cause all currently waiting requests to exit as soon as they get the lock
+    interrupt_counters[client_id] += 1
+    
+    if client_id in active_stop_events:
+        logger.info(f"Manual interruption requested for ClientID: {client_id}. All queued tasks will be flushed.")
+        active_stop_events[client_id].set()
+        return {"status": "interrupted", "client_id": client_id, "queue": "flushed"}
+    return {"status": "idle", "client_id": client_id, "queue": "flushed"}
 
 @app.get("/health")
 async def health(): return {"status": "ready"}
