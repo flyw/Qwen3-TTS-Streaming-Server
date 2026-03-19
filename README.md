@@ -72,13 +72,13 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./Qwen3-TT
 
 ```bash
 # Recommended: X-Vector mode is enabled by default in server.py to prevent prompt leakage
-# You only need the reference audio file. No transcript required.
+# Now includes global control over temperature and repetition penalty via CLI
 python server.py \
   --model-path ./Qwen3-TTS-12Hz-1.7B-Base \
   --ref-audio reference.wav \
-  --port 9000 \
-  --chunk-size 6 \
-  --pre-buffer 2
+  --temperature 0.8 \
+  --repetition-penalty 1.1 \
+  --chunk-size 6
 ```
 
 ---
@@ -92,11 +92,12 @@ python server.py \
 ```json
 {
   "text": "Hello world.",
-  "language": "English",
-  "temperature": 0.5,
+  "language": "Auto",
   "client_id": "user_123"
 }
 ```
+
+> **Note**: `temperature` and `repetition_penalty` are no longer accepted in the request body. They are now managed globally on the server side to ensure synthesis stability and prevent repetition loops.
 
 **Response**: `audio/l16;rate=24000`
 - Returns a raw **PCM 16-bit, 24,000Hz** byte stream.
@@ -122,6 +123,8 @@ python server.py \
 | `--ref-audio` | `REF_AUDIO_PATH` | `None` | Path to reference audio for cloning (Required) |
 | `--host` | `HOST` | `0.0.0.0` | Server host |
 | `--port` | `PORT` | `9000` | Server port |
+| `--temperature` | *None* | `0.8` | Sampling temperature (Server-side global) |
+| `--repetition-penalty` | *None* | `1.1` | Repetition penalty (Server-side global) |
 | `--chunk-size` | *None* | `1` | Global tokens to buffer before decoding/sending (Higher = better RTF) |
 | `--pre-buffer` | *None* | `0` | Number of chunks to buffer on server before sending the first packet |
 | `client_id` | *API Only* | `"default"` | Unique ID per user to enable parallel processing |
@@ -135,7 +138,7 @@ A ready-to-use HTML client (`webui.html`) is included to test the streaming API.
 1. Start the server (e.g., on port 9000).
 2. Open `webui.html` in any modern web browser.
 3. Configure your **Server URL** and **Client ID**.
-4. Adjust **Language** and **Temperature** as needed.
+4. Select your **Language** (recommended: `Auto` for mixed-language).
 5. Click **Play** to start synthesis. 
 6. Observe the **Buffered** count in the stats board.
 

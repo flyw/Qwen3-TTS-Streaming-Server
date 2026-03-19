@@ -57,6 +57,11 @@ else:
     DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
     logger.info(f"Performance mode: Using {DTYPE}")
 
+# ================= Global Generation Settings =================
+# These can now be set via command-line arguments.
+DEFAULT_TEMPERATURE = 0.8
+DEFAULT_REPETITION_PENALTY = 1.1
+
 model_wrapper = None
 default_voice_prompt = None
 GLOBAL_SAVE_ENABLED = False 
@@ -71,7 +76,6 @@ class TTSRequest(BaseModel):
     language: str = "Chinese"
     ref_audio: Optional[str] = None
     max_new_tokens: int = 2048
-    temperature: float = 0.5
     client_id: Optional[str] = Field(default="default", description="Unique ID for each client to maintain sequence")
 
 def get_pcm_bytes(wav: np.ndarray) -> bytes:
@@ -344,7 +348,8 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
                     voice_clone_prompt=default_voice_prompt,
                     language=request.language,
                     max_new_tokens=request.max_new_tokens,
-                    temperature=request.temperature
+                    temperature=DEFAULT_TEMPERATURE,
+                    repetition_penalty=DEFAULT_REPETITION_PENALTY
                 )
                 inf_end = time.time()
                 inf_dur = inf_end - inf_start
@@ -411,9 +416,13 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=PORT, help="Port to bind the server to")
     parser.add_argument("--chunk-size", type=int, default=1, help="Default tokens to buffer before sending")
     parser.add_argument("--pre-buffer", type=int, default=0, help="Number of chunks to buffer on server before sending")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--repetition-penalty", type=float, default=1.1, help="Repetition penalty")
 
     args = parser.parse_args()
 
+    DEFAULT_TEMPERATURE = args.temperature
+    DEFAULT_REPETITION_PENALTY = args.repetition_penalty
     GLOBAL_SAVE_ENABLED = args.save
 
     if not os.path.exists(args.ref_audio):
