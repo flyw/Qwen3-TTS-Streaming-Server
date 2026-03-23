@@ -31,9 +31,9 @@ class TextFrontend:
 
     def _handle_special_symbols(self, text: str) -> str:
         """
-        处理特殊符号，同时保护 URL 等技术格式
+        处理商用文本中的特殊符号
         """
-        # 1. 带圈数字处理
+        # 1. 带圈数字处理：在其后增加“， ”以获得清晰列表停顿
         circled_numbers = {
             '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
             '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⑩': '10',
@@ -41,18 +41,17 @@ class TextFrontend:
             '⑯': '16', '⑰': '17', '⑱': '18', '⑲': '19', '⑳': '20'
         }
         for char, repl in circled_numbers.items():
-            text = text.replace(char, f" {repl}，")
+            text = text.replace(char, f" {repl}， ")
             
-        # 2. 顿号优化
-        text = text.replace('、', '，')
+        # 2. 顿号优化：转为带空格的逗号
+        text = text.replace('、', '， ')
         
-        # 3. 分号转句号
-        text = text.replace(';', '。').replace('；', '。')
+        # 3. 分号转为带空格的句号
+        text = text.replace(';', '。 ').replace('；', '。 ')
 
-        # 4. [优化] 冒号转句号（保护 URL）
-        # 使用正则：匹配冒号，但要求其后面不能紧跟 "//"（URL 特征）
-        # 同时支持中英文冒号
-        text = re.sub(r'[:：](?!//)', '。', text)
+        # 4. 冒号转为带空格的句号（保护 URL）
+        # 关键点：在句号后增加空格，强制触发模型停顿
+        text = re.sub(r'[:：](?!//)', '。 ', text)
         
         return text
 
@@ -106,33 +105,29 @@ class TextFrontend:
 
     def normalize(self, text: str, language: str = "Chinese"):
         if not text: return "", language
-        
-        orig_text = text
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
-        # 1. 先识别时间（保留冒号用于匹配）和电话
+        # 1. 业务格式
         text = self._handle_time_ranges(text, actual_lang)
         text = self._handle_phone_numbers(text, actual_lang)
 
-        # 2. 运行特殊符号处理（此时已带 URL 保护逻辑）
+        # 2. 符号处理（注入空格停顿信号）
         text = self._handle_special_symbols(text)
 
-        # 3. 中间处理：WeTextProcessing
+        # 3. WeTextProcessing
         if HAS_WETEXT and self.tn_processor and is_chinese:
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
                 logger.error(f"WeTextProcessing error: {e}")
 
-        # 4. 英文缩写处理
+        # 4. 英文缩写
         text = self._handle_abbreviations(text)
 
-        # 5. 后处理
+        # 5. 后处理：清理连续的标点和空格
         text = re.sub(r'\s+', ' ', text).strip()
-        text = re.sub(r'[。，,]{2,}', '。', text)
+        # 将多个标点合并
+        text = re.sub(r'[。，,]{2,}', '。 ', text)
         
-        if orig_text.strip() != text.strip():
-            logger.info(f"TN: '{orig_text}' -> '{text}'")
-            
         return text, actual_lang
