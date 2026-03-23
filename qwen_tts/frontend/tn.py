@@ -31,7 +31,7 @@ class TextFrontend:
 
     def _handle_special_symbols(self, text: str) -> str:
         """
-        处理商用文本中的特殊符号
+        处理特殊符号，同时保护 URL 等技术格式
         """
         # 1. 带圈数字处理
         circled_numbers = {
@@ -46,10 +46,13 @@ class TextFrontend:
         # 2. 顿号优化
         text = text.replace('、', '，')
         
-        # 3. [新需求] 分号、冒号转句号，以获得更明确的停顿
+        # 3. 分号转句号
         text = text.replace(';', '。').replace('；', '。')
-        # 注意：此处替换的是非时间格式中的冒号
-        text = text.replace(':', '。').replace('：', '。')
+
+        # 4. [优化] 冒号转句号（保护 URL）
+        # 使用正则：匹配冒号，但要求其后面不能紧跟 "//"（URL 特征）
+        # 同时支持中英文冒号
+        text = re.sub(r'[:：](?!//)', '。', text)
         
         return text
 
@@ -110,7 +113,7 @@ class TextFrontend:
         text = self._handle_time_ranges(text, actual_lang)
         text = self._handle_phone_numbers(text, actual_lang)
 
-        # 2. [关键点] 在时间处理完后，再把剩余的所有分号、冒号转为句号
+        # 2. 运行特殊符号处理（此时已带 URL 保护逻辑）
         text = self._handle_special_symbols(text)
 
         # 3. 中间处理：WeTextProcessing
@@ -125,7 +128,6 @@ class TextFrontend:
 
         # 5. 后处理
         text = re.sub(r'\s+', ' ', text).strip()
-        # 预防性清理：如果出现了连续的句号，保留一个即可
         text = re.sub(r'[。，,]{2,}', '。', text)
         
         return text, actual_lang
