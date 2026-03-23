@@ -14,32 +14,22 @@ try:
 except ImportError:
     HAS_WETEXT = False
     _TN_PROCESSOR = None
-    logger.warning("wetextprocessing not found. Commercial TN engine is disabled. Fallback to regex.")
+    logger.warning("wetextprocessing not found. Fallback to regex.")
 
 class TextFrontend:
     def __init__(self):
         self.tn_processor = _TN_PROCESSOR
-        # 设置支持的语种，确保与模型能力匹配
         langid.set_languages(['zh', 'en', 'ja', 'ko', 'de', 'fr', 'ru', 'es', 'it'])
 
     def _detect_language(self, text: str) -> str:
         lang, _ = langid.classify(text)
-        # 映射到模型支持的语种标识
         mapping = {
-            'zh': "Chinese",
-            'en': "English",
-            'ja': "Japanese",
-            'ko': "Korean",
-            'de': "German",
-            'fr': "French",
-            'ru': "Russian",
-            'es': "Spanish",
-            'it': "Italian"
+            'zh': "Chinese", 'en': "English", 'ja': "Japanese", 'ko': "Korean",
+            'de': "German", 'fr': "French", 'ru': "Russian", 'es': "Spanish", 'it': "Italian"
         }
         return mapping.get(lang, "Chinese")
 
     def _handle_special_symbols(self, text: str) -> str:
-        # 带圈数字处理
         circled_numbers = {
             '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
             '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⑩': '10',
@@ -54,49 +44,30 @@ class TextFrontend:
     def _handle_phone_numbers(self, text: str, language: str) -> str:
         """
         处理电话号码 (商用级)：
-        座机 010-62876965 -> 零 幺 零，六 二 八 七，六 九 六 五 (4位一组)
+        座机 010-62876965 -> 零 幺 零 。 六 二 八 七 ， 六 九 六 五
         """
         if language.lower() not in ["chinese", "zh"]: return text
         
-        # 1. 匹配座机 (3-4位区号 + 7-8位号码)
         def format_fixed(match):
             area = match.group(1).replace('1', '幺')
             phone = match.group(2).replace('1', '幺')
-            
             area_str = " ".join(list(area))
             
-            # 针对 8 位电话进行 4-4 分段
+            # 使用“。”增加区号后的停顿感
             if len(phone) == 8:
-                part1 = " ".join(list(phone[0:4]))
-                part2 = " ".join(list(phone[4:8]))
-                return f"{area_str}，{part1}，{part2}"
-            # 针对 7 位电话进行 3-4 分段
+                return f"{area_str} 。 {" ".join(list(phone[0:4]))} ， {" ".join(list(phone[4:8]))}"
             elif len(phone) == 7:
-                part1 = " ".join(list(phone[0:3]))
-                part2 = " ".join(list(phone[3:7]))
-                return f"{area_str}，{part1}，{part2}"
-            else:
-                return f"{area_str}，{' '.join(list(phone))}"
+                return f"{area_str} 。 {" ".join(list(phone[0:3]))} ， {" ".join(list(phone[3:7]))}"
+            return f"{area_str} 。 {" ".join(list(phone))}"
 
         text = re.sub(r'(\d{3,4})-(\d{7,8})', format_fixed, text)
 
-        # 2. 匹配手机 (11位) -> 3-4-4 分段
         def format_mobile(match):
             m = match.group(0).replace('1', '幺')
-            part1 = " ".join(list(m[0:3]))
-            part2 = " ".join(list(m[3:7]))
-            part3 = " ".join(list(m[7:]))
-            return f"{part1}，{part2}，{part3}"
+            return f"{" ".join(list(m[0:3]))} ， {" ".join(list(m[3:7]))} ， {" ".join(list(m[7:]))}"
 
         text = re.sub(r'\b(1[3-9]\d{9})\b', format_mobile, text)
         return text
-
-    def _handle_abbreviations(self, text: str) -> str:
-        def space_out_abbr(match):
-            word = match.group(0)
-            if not any(c.isalpha() for c in word) or any(c.islower() for c in word): return word
-            return " ".join(list(re.sub(r'[^A-Z0-9]', '', word)))
-        return re.sub(r'\b[A-Z0-9\-]{2,}\b', space_out_abbr, text)
 
     def _handle_time_ranges(self, text: str, language: str) -> str:
         pattern = r'(\d{1,2}):(\d{2})\s*[—\-~]\s*(\d{1,2}):(\d{2})'
@@ -105,12 +76,10 @@ class TextFrontend:
             if language.lower() in ["chinese", "zh"]:
                 p1 = "凌晨" if h1 < 6 else "早" if h1 < 12 else "中午" if h1 < 13 else "下午" if h1 < 18 else "晚"
                 p2 = "凌晨" if h2 < 6 else "早" if h2 < 12 else "中午" if h2 < 13 else "下午" if h2 < 18 else "晚"
-                h1_c = {0:12, 1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10, 11:11, 12:12}[h1%12]
-                h2_c = {0:12, 1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10, 11:11, 12:12}[h2%12]
-                m1_s = f"{m1}分" if m1 > 0 else ""
-                m2_s = f"{m2}分" if m2 > 0 else ""
                 cn_nums = ["零","一","二","三","四","五","六","七","八","九","十","十一","十二"]
-                return f"{p1}{cn_nums[h1_c]}点{m1_s}到{p2}{cn_nums[h2_c]}点{m2_s}"
+                t1 = f"{p1}{cn_nums[h1%12 if h1%12!=0 else 12]}点{str(m1)+'分' if m1>0 else ''}"
+                t2 = f"{p2}{cn_nums[h2%12 if h2%12!=0 else 12]}点{str(m2)+'分' if m2>0 else ''}"
+                return f"{t1}到{t2}"
             else:
                 def en_t(h, m):
                     p = "A.M." if h < 12 else "P.M."
@@ -119,27 +88,32 @@ class TextFrontend:
                 return f"{en_t(h1, m1)} to {en_t(h2, m2)}"
         return re.sub(pattern, replace_time, text)
 
+    def _handle_abbreviations(self, text: str) -> str:
+        def space_out_abbr(match):
+            word = match.group(0)
+            if not any(c.isalpha() for c in word) or any(c.islower() for c in word): return word
+            return " ".join(list(re.sub(r'[^A-Z0-9]', '', word)))
+        return re.sub(r'\b[A-Z0-9\-]{2,}\b', space_out_abbr, text)
+
     def normalize(self, text: str, language: str = "Chinese"):
-        """
-        返回: (normalized_text, actual_language)
-        """
         if not text: return "", language
-        
-        # 1. 检测语言
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
-        # 2. WeTextProcessing
+        # 1. [核心调整] 高优先级规则（电话、时间、符号）
+        # 必须在 WeTextProcessing 之前，防止其破坏原始数字格式
+        text = self._handle_phone_numbers(text, actual_lang)
+        text = self._handle_time_ranges(text, actual_lang)
+        text = self._handle_special_symbols(text)
+
+        # 2. 中间处理：WeTextProcessing 处理剩余的数字和日期
         if HAS_WETEXT and self.tn_processor and is_chinese:
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
                 logger.error(f"WeTextProcessing error: {e}")
 
-        # 3. 业务规则
-        text = self._handle_special_symbols(text)
-        text = self._handle_phone_numbers(text, actual_lang)
-        text = self._handle_time_ranges(text, actual_lang)
+        # 3. 英文缩写处理
         text = self._handle_abbreviations(text)
 
         # 4. 后处理
