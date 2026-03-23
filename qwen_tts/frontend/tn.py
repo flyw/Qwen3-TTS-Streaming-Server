@@ -2,31 +2,33 @@ import re
 import logging
 import langid
 
+# 设置日志，方便调试
+logger = logging.getLogger("TextFrontend")
+
 try:
     from wetextprocessing.chinese.processor import Processor
     HAS_WETEXT = True
+    # 初始化 WeTextProcessing
+    _TN_PROCESSOR = Processor(remove_interjection=False, full_to_half=True)
+    logger.info("Successfully loaded WeTextProcessing engine.")
 except ImportError:
     HAS_WETEXT = False
-    logging.warning("wetextprocessing not found. Falling back to basic regex normalization.")
+    _TN_PROCESSOR = None
+    logger.warning("wetextprocessing not found. Commercial TN engine is disabled. Fallback to regex.")
 
 class TextFrontend:
     def __init__(self):
-        if HAS_WETEXT:
-            self.tn_processor = Processor(remove_interjection=False, full_to_half=True)
-        else:
-            self.tn_processor = None
-            
+        self.tn_processor = _TN_PROCESSOR
         langid.set_languages(['zh', 'en', 'ja', 'ko', 'de', 'fr', 'ru', 'es', 'it'])
 
     def _detect_language(self, text: str) -> str:
-        lang, confidence = langid.classify(text)
-        if lang == 'zh':
-            return "Chinese"
-        elif lang == 'en':
-            return "English"
+        lang, _ = langid.classify(text)
+        if lang == 'zh': return "Chinese"
+        if lang == 'en': return "English"
         return "Chinese"
 
     def _handle_special_symbols(self, text: str) -> str:
+        # 带圈数字处理
         circled_numbers = {
             '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
             '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⑩': '10',
@@ -35,113 +37,68 @@ class TextFrontend:
         }
         for char, repl in circled_numbers.items():
             text = text.replace(char, f" {repl}，")
-            
         text = text.replace('、', '，')
         return text
 
     def _handle_phone_numbers(self, text: str, language: str) -> str:
-        """
-        处理电话号码 (商用级)：010-62876965 -> 零 幺 零，六 二 八 七 六 九 六 五
-        """
-        if language.lower() not in ["chinese", "zh"]:
-            return text
-
-        # 1. 处理座机: 010-62876965
-        def format_fixed(match):
-            area = match.group(1).replace('1', '幺')
-            phone = match.group(2).replace('1', '幺')
-            area_str = " ".join(list(area))
-            phone_str = " ".join(list(phone))
-            return f"{area_str}，{phone_str}"
-
-        text = re.sub(r'(\d{3,4})-(\d{7,8})', format_fixed, text)
-
-        # 2. 处理手机号: 13812345678 -> 幺 三 八，一 二 三 四，五 六 七 八
-        def format_mobile(match):
-            m = match.group(0).replace('1', '幺')
-            # 采用 3-4-4 分段
-            part1 = " ".join(list(m[0:3]))
-            part2 = " ".join(list(m[3:7]))
-            part3 = " ".join(list(m[7:]))
-            return f"{part1}，{part2}，{part3}"
-
-        text = re.sub(r'\b(1[3-9]\d{9})\b', format_mobile, text)
-        
+        if language.lower() not in ["chinese", "zh"]: return text
+        # 匹配座机
+        text = re.sub(r'(\d{3,4})-(\d{7,8})', lambda m: " ".join(list(m.group(1).replace('1','幺'))) + "，" + " ".join(list(m.group(2).replace('1','幺'))), text)
+        # 匹配手机
+        text = re.sub(r'\b(1[3-9]\d{9})\b', lambda m: " ".join(list(m.group(0)[0:3].replace('1','幺'))) + "，" + " ".join(list(m.group(0)[3:7].replace('1','幺'))) + "，" + " ".join(list(m.group(0)[7:].replace('1','幺'))), text)
         return text
 
     def _handle_abbreviations(self, text: str) -> str:
         def space_out_abbr(match):
             word = match.group(0)
-            if not any(c.isalpha() for c in word):
-                return word
-            if any(c.islower() for c in word):
-                return word
-            clean_word = re.sub(r'[^A-Z0-9]', '', word)
-            return " ".join(list(clean_word))
-
-        pattern = r'\b[A-Z0-9\-]{2,}\b'
-        return re.sub(pattern, space_out_abbr, text)
+            if not any(c.isalpha() for c in word) or any(c.islower() for c in word): return word
+            return " ".join(list(re.sub(r'[^A-Z0-9]', '', word)))
+        return re.sub(r'\b[A-Z0-9\-]{2,}\b', space_out_abbr, text)
 
     def _handle_time_ranges(self, text: str, language: str) -> str:
         pattern = r'(\d{1,2}):(\d{2})\s*[—\-~]\s*(\d{1,2}):(\d{2})'
-        
         def replace_time(match):
             h1, m1, h2, m2 = map(int, match.groups())
-            is_chinese = language.lower() in ["chinese", "zh"]
-
-            def get_period_cn(h):
-                if 0 <= h < 6: return "凌晨"
-                if 6 <= h < 12: return "早"
-                if 12 <= h < 13: return "中午"
-                if 13 <= h < 18: return "下午"
-                return "晚"
-
-            def get_hour_cn(h):
-                h = h % 12
-                if h == 0: h = 12
-                mapping = {1:"一", 2:"二", 3:"三", 4:"四", 5:"五", 6:"六", 7:"七", 8:"八", 9:"九", 10:"十", 11:"十一", 12:"十二"}
-                return mapping.get(h, str(h))
-
-            if is_chinese:
-                t1 = f"{get_period_cn(h1)}{get_hour_cn(h1)}点" + (f"{m1}分" if m1 > 0 else "")
-                t2 = f"{get_period_cn(h2)}{get_hour_cn(h2)}点" + (f"{m2}分" if m2 > 0 else "")
-                return f"{t1}到{t2}"
+            if language.lower() in ["chinese", "zh"]:
+                p1 = "凌晨" if h1 < 6 else "早" if h1 < 12 else "中午" if h1 < 13 else "下午" if h1 < 18 else "晚"
+                p2 = "凌晨" if h2 < 6 else "早" if h2 < 12 else "中午" if h2 < 13 else "下午" if h2 < 18 else "晚"
+                h1_c = {0:12, 1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10, 11:11, 12:12}[h1%12]
+                h2_c = {0:12, 1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10, 11:11, 12:12}[h2%12]
+                m1_s = f"{m1}分" if m1 > 0 else ""
+                m2_s = f"{m2}分" if m2 > 0 else ""
+                # 转为中文数字以便直接播报，防止被后续处理干扰
+                cn_nums = ["零","一","二","三","四","五","六","七","八","九","十","十一","十二"]
+                return f"{p1}{cn_nums[h1_c]}点{m1_s}到{p2}{cn_nums[h2_c]}点{m2_s}"
             else:
-                def get_time_en(h, m):
-                    period = "A.M." if h < 12 else "P.M."
-                    h = h % 12
-                    if h == 0: h = 12
-                    words = ["twelve", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven"]
-                    h_str = words[h % 12]
-                    m_str = f" {m}" if m > 0 else ""
-                    return f"{h_str}{m_str} {period}"
-                return f"{get_time_en(h1, m1)} to {get_time_en(h2, m2)}"
-
+                def en_t(h, m):
+                    p = "A.M." if h < 12 else "P.M."
+                    h_w = ["twelve","one","two","three","four","five","six","seven","eight","nine","ten","eleven"][h%12]
+                    return f"{h_w}{' '+str(m) if m>0 else ''} {p}"
+                return f"{en_t(h1, m1)} to {en_t(h2, m2)}"
         return re.sub(pattern, replace_time, text)
 
     def normalize(self, text: str, language: str = "Chinese") -> str:
-        if not text:
-            return ""
+        if not text: return ""
+        
+        # 1. 检测语言
+        actual_lang = self._detect_language(text) if language.lower() == "auto" else language
+        is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
-        if language.lower() == "auto":
-            actual_lang = self._detect_language(text)
-        else:
-            actual_lang = language
-
-        # 1. 符号与电话处理 (最高优先级)
-        text = self._handle_special_symbols(text)
-        text = self._handle_phone_numbers(text, actual_lang)
-
-        # 2. 时间与缩写
-        text = self._handle_time_ranges(text, actual_lang)
-        text = self._handle_abbreviations(text)
-
-        # 3. 基础 TN
-        if self.tn_processor and actual_lang == "Chinese":
+        # 2. [关键修改] 先运行 WeTextProcessing 处理通用数字和日期
+        # 例如: "2025年1月1日" -> "二零二五年一月一日"
+        if HAS_WETEXT and self.tn_processor and is_chinese:
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
-                logging.error(f"WeTextProcessing error: {e}")
+                logger.error(f"WeTextProcessing error: {e}")
 
+        # 3. 运行自定义高优先级规则 (解决特殊格式问题)
+        # 此时处理电话、带圈数字、时间，确保它们能以最自然的节奏播报
+        text = self._handle_special_symbols(text)
+        text = self._handle_phone_numbers(text, actual_lang)
+        text = self._handle_time_ranges(text, actual_lang)
+        text = self._handle_abbreviations(text)
+
+        # 4. 后处理：清理空格
         text = re.sub(r'\s+', ' ', text).strip()
         return text
