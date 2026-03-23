@@ -13,10 +13,11 @@
 **Qwen3-TTS Streaming Server** is a high-performance, production-ready FastAPI wrapper for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). This project focuses on delivering ultra-low latency audio streaming for real-time human-computer interaction.
 
 ### What's New in This Fork?
+- **Commercial-Grade Text Normalization**: Integrated **WeTextProcessing** and a specialized English abbreviation handler. Automatically converts numbers (e.g., "2025" -> "二零二五"), units, and injects spaces into all-caps abbreviations (e.g., "RISC-V" -> "R I S C V") to ensure 100% correct pronunciation and eliminate hallucination.
 - **Extreme Performance Optimization**: Utilizes a specialized monkey-patching technique to intercept model forward passes, enabling the delivery of the first audio chunk almost instantly.
 - **Smart Queue Management**: Multiple requests from the same `client_id` (e.g., from an LLM stream) are automatically queued and processed in order, ensuring a seamless multi-sentence speaking experience.
 - **On-Demand Interruption**: New `/tts/interrupt` endpoint allows users to stop the current speech and **automatically flush all queued requests**, perfect for handling user interruptions in voice chat.
-- **High-Performance FastAPI Server**: Optimized for concurrent requests and low-latency throughput.
+- **Integrated WebUI Service**: The `webui.html` is now served directly at the root URL (`/`), no manual file opening required.
 - **Raw Binary Streaming**: Replaced SSE/Base64 with raw **PCM 16-bit** binary streaming, reducing bandwidth overhead by **~33%** and lowering client-side CPU usage.
 - **Sliding Window Audio Reconstruction**: An advanced algorithm ensures seamless audio stitching and high-quality output during streaming.
 - **Production Configuration**: Full support for CLI arguments and Environment Variables (Model path, Host, Port, Reference Audio).
@@ -38,6 +39,8 @@ The following metrics were captured using the included `webui.html` on a system 
 ## Features
 
 * **Sub-500ms Latency**: Industry-leading response time for real-time voice interaction.
+* **Smart Text Front-end**: Powered by **WeTextProcessing**, handling complex Chinese-English mixed text, dates, and numbers with production-level accuracy.
+* **Abbreviation "Spell-out"**: Automatically handles technical terms like RISC-V, AI, and LLM by injecting spaces to guide the model's pronunciation.
 * **X-Vector Only Mode**: Support for pure speaker embedding cloning, which **100% eliminates prompt leakage** (no more hallucinating or repeating reference text).
 * **Configurable Streaming Buffer**: Prevent audio stuttering during network fluctuations by buffering tokens before sending (`chunk_size`).
 * **Server-Side Pre-Buffering**: Accumulate initial chunks before sending the first packet (`pre_buffer`) to provide a stable initial stream.
@@ -53,8 +56,11 @@ The following metrics were captured using the included `webui.html` on a system 
 ```bash
 conda create -n qwen3-tts python=3.12 -y
 conda activate qwen3-tts
-pip install -U qwen-tts uvicorn fastapi soundfile
-# Highly recommended: FlashAttention 2
+
+# Install the project and all dependencies (including WeTextProcessing and FastAPI)
+pip install -e .
+
+# Highly recommended: FlashAttention 2 for faster inference
 pip install -U flash-attn --no-build-isolation
 ```
 
@@ -133,14 +139,12 @@ python server.py \
 
 ## WebUI Testing
 
-A ready-to-use HTML client (`webui.html`) is included to test the streaming API.
+The server now hosts a ready-to-use HTML client directly.
 
 1. Start the server (e.g., on port 9000).
-2. Open `webui.html` in any modern web browser.
-3. Configure your **Server URL** and **Client ID**.
-4. Select your **Language** (recommended: `Auto` for mixed-language).
-5. Click **Play** to start synthesis. 
-6. Observe the **Buffered** count in the stats board.
+2. Open your browser and navigate to `http://localhost:9000`.
+3. Configure your **Client ID** and **Reference Audio**.
+4. Click **Play** to start synthesis and observe real-time metrics.
 
 ---
 

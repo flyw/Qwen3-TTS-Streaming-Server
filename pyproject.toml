@@ -29,6 +29,10 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
+  "wetextprocessing",
+  "fastapi",
+  "uvicorn",
+  "pydantic"
 ]
 
 [project.urls]
