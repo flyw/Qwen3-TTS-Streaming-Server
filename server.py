@@ -327,7 +327,8 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
             return
 
         # [Commercial-Grade Normalization]: Use WeTextProcessing + Custom Lexicon
-        clean_text = frontend.normalize(request.text.strip(), language=request.language)
+        # Now returns (clean_text, actual_lang) to handle "Auto" correctly
+        clean_text, actual_lang = frontend.normalize(request.text.strip(), language=request.language)
         # Ensure at least a space for better inference start
         clean_text = " " + clean_text
         
@@ -357,7 +358,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
                 model_wrapper.generate_voice_clone(
                     text=clean_text, 
                     voice_clone_prompt=default_voice_prompt,
-                    language=request.language,
+                    language=actual_lang, # 使用前端探测出的实际语种
                     max_new_tokens=request.max_new_tokens,
                     temperature=DEFAULT_TEMPERATURE,
                     repetition_penalty=DEFAULT_REPETITION_PENALTY

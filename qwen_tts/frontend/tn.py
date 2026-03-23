@@ -19,13 +19,24 @@ except ImportError:
 class TextFrontend:
     def __init__(self):
         self.tn_processor = _TN_PROCESSOR
+        # 设置支持的语种，确保与模型能力匹配
         langid.set_languages(['zh', 'en', 'ja', 'ko', 'de', 'fr', 'ru', 'es', 'it'])
 
     def _detect_language(self, text: str) -> str:
         lang, _ = langid.classify(text)
-        if lang == 'zh': return "Chinese"
-        if lang == 'en': return "English"
-        return "Chinese"
+        # 映射到模型支持的语种标识
+        mapping = {
+            'zh': "Chinese",
+            'en': "English",
+            'ja': "Japanese",
+            'ko': "Korean",
+            'de': "German",
+            'fr': "French",
+            'ru': "Russian",
+            'es': "Spanish",
+            'it': "Italian"
+        }
+        return mapping.get(lang, "Chinese")
 
     def _handle_special_symbols(self, text: str) -> str:
         # 带圈数字处理
@@ -66,7 +77,6 @@ class TextFrontend:
                 h2_c = {0:12, 1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8, 9:9, 10:10, 11:11, 12:12}[h2%12]
                 m1_s = f"{m1}分" if m1 > 0 else ""
                 m2_s = f"{m2}分" if m2 > 0 else ""
-                # 转为中文数字以便直接播报，防止被后续处理干扰
                 cn_nums = ["零","一","二","三","四","五","六","七","八","九","十","十一","十二"]
                 return f"{p1}{cn_nums[h1_c]}点{m1_s}到{p2}{cn_nums[h2_c]}点{m2_s}"
             else:
@@ -77,28 +87,29 @@ class TextFrontend:
                 return f"{en_t(h1, m1)} to {en_t(h2, m2)}"
         return re.sub(pattern, replace_time, text)
 
-    def normalize(self, text: str, language: str = "Chinese") -> str:
-        if not text: return ""
+    def normalize(self, text: str, language: str = "Chinese"):
+        """
+        返回: (normalized_text, actual_language)
+        """
+        if not text: return "", language
         
         # 1. 检测语言
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
-        # 2. [关键修改] 先运行 WeTextProcessing 处理通用数字和日期
-        # 例如: "2025年1月1日" -> "二零二五年一月一日"
+        # 2. WeTextProcessing
         if HAS_WETEXT and self.tn_processor and is_chinese:
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
                 logger.error(f"WeTextProcessing error: {e}")
 
-        # 3. 运行自定义高优先级规则 (解决特殊格式问题)
-        # 此时处理电话、带圈数字、时间，确保它们能以最自然的节奏播报
+        # 3. 业务规则
         text = self._handle_special_symbols(text)
         text = self._handle_phone_numbers(text, actual_lang)
         text = self._handle_time_ranges(text, actual_lang)
         text = self._handle_abbreviations(text)
 
-        # 4. 后处理：清理空格
+        # 4. 后处理
         text = re.sub(r'\s+', ' ', text).strip()
-        return text
+        return text, actual_lang
