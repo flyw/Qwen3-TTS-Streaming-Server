@@ -104,30 +104,12 @@ class TextFrontend:
             return " ".join(list(re.sub(r'[^A-Z0-9]', '', word)))
         return re.sub(r'\b[A-Z0-9\-]{2,}\b', space_out_abbr, text)
 
-    def _handle_urls(self, text: str) -> str:
-        """
-        将网址中的点替换为“点”，方便 TTS 发音
-        """
-        # 匹配常见的域名后缀，如 .com, .cn, .net, .org, .edu 等
-        # 仅匹配字母数字后面的点+后缀
-        url_pattern = r'(\w+)\.(com|cn|net|org|edu|io|me|top|vip|cc|gov|com\.cn)\b'
-        
-        def replace_url(match):
-            domain = match.group(1)
-            suffix = match.group(2)
-            return f"{domain}点{suffix}"
-            
-        return re.sub(url_pattern, replace_url, text, flags=re.IGNORECASE)
-
     def normalize(self, text: str, language: str = "Chinese"):
         if not text: return "", language
         
         orig_text = text
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
-
-        # 0. 网址处理 (新增)
-        text = self._handle_urls(text)
 
         # 1. 先识别时间（保留冒号用于匹配）和电话
         text = self._handle_time_ranges(text, actual_lang)
