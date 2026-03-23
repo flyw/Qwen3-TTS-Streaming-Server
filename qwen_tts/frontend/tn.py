@@ -52,11 +52,43 @@ class TextFrontend:
         return text
 
     def _handle_phone_numbers(self, text: str, language: str) -> str:
+        """
+        处理电话号码 (商用级)：
+        座机 010-62876965 -> 零 幺 零，六 二 八 七，六 九 六 五 (4位一组)
+        """
         if language.lower() not in ["chinese", "zh"]: return text
-        # 匹配座机
-        text = re.sub(r'(\d{3,4})-(\d{7,8})', lambda m: " ".join(list(m.group(1).replace('1','幺'))) + "，" + " ".join(list(m.group(2).replace('1','幺'))), text)
-        # 匹配手机
-        text = re.sub(r'\b(1[3-9]\d{9})\b', lambda m: " ".join(list(m.group(0)[0:3].replace('1','幺'))) + "，" + " ".join(list(m.group(0)[3:7].replace('1','幺'))) + "，" + " ".join(list(m.group(0)[7:].replace('1','幺'))), text)
+        
+        # 1. 匹配座机 (3-4位区号 + 7-8位号码)
+        def format_fixed(match):
+            area = match.group(1).replace('1', '幺')
+            phone = match.group(2).replace('1', '幺')
+            
+            area_str = " ".join(list(area))
+            
+            # 针对 8 位电话进行 4-4 分段
+            if len(phone) == 8:
+                part1 = " ".join(list(phone[0:4]))
+                part2 = " ".join(list(phone[4:8]))
+                return f"{area_str}，{part1}，{part2}"
+            # 针对 7 位电话进行 3-4 分段
+            elif len(phone) == 7:
+                part1 = " ".join(list(phone[0:3]))
+                part2 = " ".join(list(phone[3:7]))
+                return f"{area_str}，{part1}，{part2}"
+            else:
+                return f"{area_str}，{' '.join(list(phone))}"
+
+        text = re.sub(r'(\d{3,4})-(\d{7,8})', format_fixed, text)
+
+        # 2. 匹配手机 (11位) -> 3-4-4 分段
+        def format_mobile(match):
+            m = match.group(0).replace('1', '幺')
+            part1 = " ".join(list(m[0:3]))
+            part2 = " ".join(list(m[3:7]))
+            part3 = " ".join(list(m[7:]))
+            return f"{part1}，{part2}，{part3}"
+
+        text = re.sub(r'\b(1[3-9]\d{9})\b', format_mobile, text)
         return text
 
     def _handle_abbreviations(self, text: str) -> str:
