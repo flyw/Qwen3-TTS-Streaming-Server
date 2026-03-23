@@ -30,6 +30,10 @@ class TextFrontend:
         return mapping.get(lang, "Chinese")
 
     def _handle_special_symbols(self, text: str) -> str:
+        """
+        处理商用文本中的特殊符号
+        """
+        # 1. 带圈数字处理
         circled_numbers = {
             '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
             '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⑩': '10',
@@ -38,22 +42,24 @@ class TextFrontend:
         }
         for char, repl in circled_numbers.items():
             text = text.replace(char, f" {repl}，")
+            
+        # 2. 顿号优化
         text = text.replace('、', '，')
+        
+        # 3. [新需求] 分号、冒号转句号，以获得更明确的停顿
+        text = text.replace(';', '。').replace('；', '。')
+        # 注意：此处替换的是非时间格式中的冒号
+        text = text.replace(':', '。').replace('：', '。')
+        
         return text
 
     def _handle_phone_numbers(self, text: str, language: str) -> str:
-        """
-        处理电话号码 (商用级)：
-        座机 010-62876965 -> 零 幺 零 。 六 二 八 七 ， 六 九 六 五
-        """
         if language.lower() not in ["chinese", "zh"]: return text
         
         def format_fixed(match):
             area = match.group(1).replace('1', '幺')
             phone = match.group(2).replace('1', '幺')
             area_str = " ".join(list(area))
-            
-            # 使用“。”增加区号后的停顿感
             if len(phone) == 8:
                 return f"{area_str} 。 {" ".join(list(phone[0:4]))} ， {" ".join(list(phone[4:8]))}"
             elif len(phone) == 7:
@@ -100,22 +106,26 @@ class TextFrontend:
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
-        # 1. [核心调整] 高优先级规则（电话、时间、符号）
-        # 必须在 WeTextProcessing 之前，防止其破坏原始数字格式
-        text = self._handle_phone_numbers(text, actual_lang)
+        # 1. 先识别时间（保留冒号用于匹配）和电话
         text = self._handle_time_ranges(text, actual_lang)
+        text = self._handle_phone_numbers(text, actual_lang)
+
+        # 2. [关键点] 在时间处理完后，再把剩余的所有分号、冒号转为句号
         text = self._handle_special_symbols(text)
 
-        # 2. 中间处理：WeTextProcessing 处理剩余的数字和日期
+        # 3. 中间处理：WeTextProcessing
         if HAS_WETEXT and self.tn_processor and is_chinese:
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
                 logger.error(f"WeTextProcessing error: {e}")
 
-        # 3. 英文缩写处理
+        # 4. 英文缩写处理
         text = self._handle_abbreviations(text)
 
-        # 4. 后处理
+        # 5. 后处理
         text = re.sub(r'\s+', ' ', text).strip()
+        # 预防性清理：如果出现了连续的句号，保留一个即可
+        text = re.sub(r'[。，,]{2,}', '。', text)
+        
         return text, actual_lang
