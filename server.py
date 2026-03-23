@@ -327,7 +327,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
             return
 
         # [Commercial-Grade Normalization]: Use WeTextProcessing + Custom Lexicon
-        clean_text = frontend.normalize(request.text.strip())
+        clean_text = frontend.normalize(request.text.strip(), language=request.language)
         # Ensure at least a space for better inference start
         clean_text = " " + clean_text
         

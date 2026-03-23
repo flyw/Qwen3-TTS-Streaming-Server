@@ -32,7 +32,8 @@ dependencies = [
   "wetextprocessing",
   "fastapi",
   "uvicorn",
-  "pydantic"
+  "pydantic",
+  "langid"
 ]
 
 [project.urls]
