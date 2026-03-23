@@ -29,26 +29,39 @@ class TextFrontend:
         }
         return mapping.get(lang, "Chinese")
 
+    def _handle_resolutions(self, text: str, language: str) -> str:
+        """
+        处理分辨率格式 (商用级)：1920x1080 -> 幺 九 二 零 乘 幺 零 八 零
+        """
+        if language.lower() not in ["chinese", "zh"]: return text
+        
+        cn_digits = {
+            '0': '零', '1': '幺', '2': '二', '3': '三', '4': '四', 
+            '5': '五', '6': '六', '7': '七', '8': '八', '9': '九'
+        }
+        
+        def convert(match):
+            # 将分辨率的两个数字部分分别进行“逐个报读”转写
+            d1 = " ".join([cn_digits.get(d, d) for d in match.group(1)])
+            d2 = " ".join([cn_digits.get(d, d) for d in match.group(2)])
+            return f"{d1} 乘 {d2}"
+
+        # 匹配 数字 + x/X/*/× + 数字
+        pattern = r'(\d+)\s*[xX*×]\s*(\d+)'
+        return re.sub(pattern, convert, text)
+
     def _handle_ratios(self, text: str, language: str) -> str:
         """
-        处理比例格式：16:9 -> 16比9 (ZH) 或 16 to 9 (EN)
+        处理比例格式：16:9 -> 16比9
         """
         is_chinese = language.lower() in ["chinese", "zh"]
         pattern = r'(\d+)[:：](\d+)'
-        
         def replace_ratio(match):
             v1, v2 = match.groups()
-            if is_chinese:
-                return f"{v1}比{v2}"
-            else:
-                return f"{v1} to {v2}"
-        
+            return f"{v1}比{v2}" if is_chinese else f"{v1} to {v2}"
         return re.sub(pattern, replace_ratio, text)
 
     def _handle_special_symbols(self, text: str) -> str:
-        """
-        处理特殊符号，同时保护 URL
-        """
         # 1. 带圈数字处理
         circled_numbers = {
             '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
@@ -58,22 +71,14 @@ class TextFrontend:
         }
         for char, repl in circled_numbers.items():
             text = text.replace(char, f" {repl}， ")
-            
-        # 2. 顿号优化
+        # 2. 标点优化
         text = text.replace('、', '， ')
-        
-        # 3. 分号转句号
         text = text.replace(';', '。 ').replace('；', '。 ')
-
-        # 4. 冒号转句号（保护 URL）
-        # 此时比例(16:9)和时间(08:00)中的冒号已经被之前的函数转为文字，所以这里可以安全替换
         text = re.sub(r'[:：](?!//)', '。 ', text)
-        
         return text
 
     def _handle_phone_numbers(self, text: str, language: str) -> str:
         if language.lower() not in ["chinese", "zh"]: return text
-        
         def format_fixed(match):
             area = match.group(1).replace('1', '幺')
             phone = match.group(2).replace('1', '幺')
@@ -83,13 +88,10 @@ class TextFrontend:
             elif len(phone) == 7:
                 return f"{area_str} 。 {" ".join(list(phone[0:3]))} ， {" ".join(list(phone[3:7]))}"
             return f"{area_str} 。 {" ".join(list(phone))}"
-
         text = re.sub(r'(\d{3,4})-(\d{7,8})', format_fixed, text)
-
         def format_mobile(match):
             m = match.group(0).replace('1', '幺')
             return f"{" ".join(list(m[0:3]))} ， {" ".join(list(m[3:7]))} ， {" ".join(list(m[7:]))}"
-
         text = re.sub(r'\b(1[3-9]\d{9})\b', format_mobile, text)
         return text
 
@@ -124,30 +126,26 @@ class TextFrontend:
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
-        # 1. 识别比例 (16:9 -> 16比9)
+        # 1. 业务格式识别
+        text = self._handle_resolutions(text, actual_lang) # 1920x1080 -> 幺九二零乘幺零八零
         text = self._handle_ratios(text, actual_lang)
-
-        # 2. 识别时间范围 (08:00 -> 八点)
         text = self._handle_time_ranges(text, actual_lang)
-
-        # 3. 识别电话号码
         text = self._handle_phone_numbers(text, actual_lang)
 
-        # 4. 符号处理（此时已带 URL 保护逻辑，且比例/时间已转为汉字，剩下的冒号才是需要转句号的）
+        # 2. 符号处理
         text = self._handle_special_symbols(text)
 
-        # 5. WeTextProcessing 处理剩余数字
+        # 3. WeTextProcessing 处理剩余数字 (如 2025年)
         if HAS_WETEXT and self.tn_processor and is_chinese:
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
                 logger.error(f"WeTextProcessing error: {e}")
 
-        # 6. 英文缩写
+        # 4. 英文缩写
         text = self._handle_abbreviations(text)
 
-        # 7. 后处理
+        # 5. 后处理
         text = re.sub(r'\s+', ' ', text).strip()
         text = re.sub(r'[。，,]{2,}', '。 ', text)
-        
         return text, actual_lang
