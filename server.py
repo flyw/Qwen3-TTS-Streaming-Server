@@ -21,6 +21,7 @@ import uvicorn
 from transformers.generation.streamers import BaseStreamer
 
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from qwen_tts.frontend.tn import TextFrontend  # 导入前端处理器
 
 import contextvars
 from collections import defaultdict
@@ -28,6 +29,9 @@ from collections import defaultdict
 # ================= Configuration & Logging =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Qwen3-TTS")
+
+# 初始化前端处理器
+frontend = TextFrontend()
 
 # [Optimization 1]: Enable TF32 Hardware Acceleration
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -322,8 +326,10 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
             logger.info(f"FLUSHING queued request for ClientID: {request.client_id} due to previous interrupt call.")
             return
 
-        # Standard space padding
-        clean_text = " " + request.text.strip()
+        # [Commercial-Grade Normalization]: Use WeTextProcessing + Custom Lexicon
+        clean_text = frontend.normalize(request.text.strip())
+        # Ensure at least a space for better inference start
+        clean_text = " " + clean_text
         
         queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
