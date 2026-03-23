@@ -29,10 +29,9 @@ class TextFrontend:
     def _handle_special_symbols(self, text: str) -> str:
         """
         处理商用文本中的特殊符号
-        1. 将带圈数字 ①-⑳ 转换为标准数字 1-20
-        2. 优化顿号、处理，增加自然停顿
+        1. 将带圈数字 ①-⑳ 转换为标准数字并在后面加逗号强制停顿
+        2. 优化顿号处理
         """
-        # 带圈数字映射表
         circled_numbers = {
             '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
             '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⑩': '10',
@@ -40,11 +39,10 @@ class TextFrontend:
             '⑯': '16', '⑰': '17', '⑱': '18', '⑲': '19', '⑳': '20'
         }
         for char, repl in circled_numbers.items():
-            text = text.replace(char, f" {repl} ") # 增加空格防止与前后文字粘连
+            # 在数字后加逗号，利用标点符号强制模型产生“编号停顿感”
+            text = text.replace(char, f" {repl}，")
             
-        # 顿号优化：在中文语境下，顿号转为逗号可以获得更稳定的停顿效果
         text = text.replace('、', '，')
-        
         return text
 
     def _handle_abbreviations(self, text: str) -> str:
@@ -61,6 +59,9 @@ class TextFrontend:
         return re.sub(pattern, space_out_abbr, text)
 
     def _handle_time_ranges(self, text: str, language: str) -> str:
+        """
+        处理时间范围，例如 08:00—20:00
+        """
         pattern = r'(\d{1,2}):(\d{2})\s*[—\-~]\s*(\d{1,2}):(\d{2})'
         
         def replace_time(match):
@@ -93,7 +94,8 @@ class TextFrontend:
                     h_str = words[h % 12]
                     m_str = f" {m}" if m > 0 else ""
                     return f"{h_str}{m_str} {period}"
-                return f"From {get_time_en(h1, m1)} to {get_time_en(h2, m2)}"
+                # 移除了开头的 "From"，直接返回 "X to Y"
+                return f"{get_time_en(h1, m1)} to {get_time_en(h2, m2)}"
 
         return re.sub(pattern, replace_time, text)
 
@@ -101,28 +103,20 @@ class TextFrontend:
         if not text:
             return ""
 
-        # 1. 自动语言探测
-        actual_lang = language
         if language.lower() == "auto":
             actual_lang = self._detect_language(text)
+        else:
+            actual_lang = language
 
-        # 2. 处理特殊符号（带圈数字、顿号等）
         text = self._handle_special_symbols(text)
-
-        # 3. 优先处理时间范围
         text = self._handle_time_ranges(text, actual_lang)
-
-        # 4. 处理英文缩写：自动添加空格注入
         text = self._handle_abbreviations(text)
 
-        # 5. 应用 WeTextProcessing (仅针对中文 TN)
         if self.tn_processor and actual_lang == "Chinese":
             try:
                 text = self.tn_processor.normalize(text)
             except Exception as e:
                 logging.error(f"WeTextProcessing error: {e}")
 
-        # 6. 后处理：清理多余空格和非法字符
         text = re.sub(r'\s+', ' ', text).strip()
-        
         return text
