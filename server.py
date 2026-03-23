@@ -14,7 +14,7 @@ import torch
 import soundfile as sf
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -49,7 +49,7 @@ PORT = int(os.getenv("PORT", "9000"))
 HOST = os.getenv("HOST", "0.0.0.0")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# [Optimization 2]: Dynamic DTYPE Selection
+# [Optimization 2]: Batch decoding buffer
 if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
     DTYPE = torch.bfloat16
     logger.info("Performance mode: Using Bfloat16")
@@ -70,6 +70,11 @@ GLOBAL_PRE_BUFFER = 0
 
 app = FastAPI(title="Qwen3-TTS Thread-Safe Parallel Server")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/")
+async def index():
+    """Serve the WebUI page at the root URL."""
+    return FileResponse("webui.html")
 
 class TTSRequest(BaseModel):
     text: str
