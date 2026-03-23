@@ -319,31 +319,38 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
     my_interrupt_version = interrupt_counters[request.client_id]
 
     # Acquire lock specific to this client_id to maintain sequence for each user
-    # Multiple sentences from the same LLM stream will queue up here.
     async with client_locks[request.client_id]:
-        # [NEW]: Check if an interrupt happened while we were waiting in the queue
         if interrupt_counters[request.client_id] > my_interrupt_version:
-            logger.info(f"FLUSHING queued request for ClientID: {request.client_id} due to previous interrupt call.")
+            logger.info(f"FLUSHING queued request for ClientID: {request.client_id}")
             return
 
-        # [Commercial-Grade Normalization]: Use WeTextProcessing + Custom Lexicon
-        # Now returns (clean_text, actual_lang) to handle "Auto" correctly
+        # [Commercial-Grade Normalization]
         clean_text, actual_lang = frontend.normalize(request.text.strip(), language=request.language)
-        # Ensure at least a space for better inference start
         clean_text = " " + clean_text
         
+        # [Dynamic Voice Selection]: Check if request has a specific reference audio
+        current_voice_prompt = default_voice_prompt
+        if request.ref_audio:
+            try:
+                logger.info(f"Generating dynamic voice prompt for request...")
+                current_voice_prompt = model_wrapper.create_voice_clone_prompt(
+                    ref_audio=request.ref_audio,
+                    ref_text=None,
+                    x_vector_only_mode=True
+                )
+            except Exception as e:
+                logger.error(f"Failed to create dynamic voice prompt: {e}. Falling back to default.")
+
         queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
         stop_event = threading.Event()
-        
-        # Register the new stop_event as the active one for this client
         active_stop_events[request.client_id] = stop_event
         
         streamer = AudioTokenStreamer(
             model_wrapper, 
             queue, 
             loop, 
-            voice_prompt=default_voice_prompt, 
+            voice_prompt=current_voice_prompt, # 使用当前确定的声音
             save_enabled=GLOBAL_SAVE_ENABLED,
             chunk_size=GLOBAL_CHUNK_SIZE,
             pre_buffer=GLOBAL_PRE_BUFFER,
@@ -351,14 +358,13 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
         )
 
         def run_inference():
-            # Set the context for this specific thread
             token = active_streamer.set(streamer)
             inf_start = time.time()
             try:
                 model_wrapper.generate_voice_clone(
                     text=clean_text, 
-                    voice_clone_prompt=default_voice_prompt,
-                    language=actual_lang, # 使用前端探测出的实际语种
+                    voice_clone_prompt=current_voice_prompt, # 使用当前确定的声音
+                    language=actual_lang,
                     max_new_tokens=request.max_new_tokens,
                     temperature=DEFAULT_TEMPERATURE,
                     repetition_penalty=DEFAULT_REPETITION_PENALTY
