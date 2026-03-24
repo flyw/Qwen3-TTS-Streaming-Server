@@ -103,8 +103,21 @@ class TextFrontend:
             return " ".join(list(re.sub(r'[^A-Z0-9]', '', word)))
         return re.sub(r'\b[A-Z0-9\-]{2,}\b', space_out_abbr, text)
 
+    def _handle_urls(self, text: str) -> str:
+        """
+        将网址替换为“屏幕上的网页连接”，避免模型尝试朗读复杂的 URL。
+        支持 http, https, www 等格式。
+        """
+        # 匹配 http://, https:// 或 www. 开头的网址
+        url_pattern = r'(https?://[^\s]+|www\.[^\s]+)'
+        return re.sub(url_pattern, ' 屏幕上的网页连接 ', text)
+
     def normalize(self, text: str, language: str = "Chinese"):
         if not text: return "", language
+
+        # 0. 网址处理 (在所有正则处理之前)
+        text = self._handle_urls(text)
+
         actual_lang = self._detect_language(text) if language.lower() == "auto" else language
         is_chinese = actual_lang.lower() in ["chinese", "zh"]
 
