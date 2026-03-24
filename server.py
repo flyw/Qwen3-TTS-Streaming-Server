@@ -377,7 +377,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
                 rtf = inf_dur / audio_dur if audio_dur > 0 else 0
                 
                 logger.info("-" * 30)
-                logger.info(f"PROCESSED: \"{clean_text.strip()[:30]}...\"")
+                logger.info(f"PROCESSED: \"{clean_text.strip()}\"")
                 logger.info(f"METRICS:   Inference: {inf_dur:.2f}s | Audio: {audio_dur:.2f}s | RTF: {rtf:.4f}")
                 logger.info("-" * 30)
                 
@@ -407,7 +407,7 @@ async def generate_token_stream(request: TTSRequest) -> AsyncGenerator[bytes, No
 
 @app.post("/tts/stream")
 async def tts_stream(request: TTSRequest):
-    logger.info(f"Received request (ClientID: {request.client_id}): {request.text[:20]}...")
+    logger.info(f"Received request (ClientID: {request.client_id}): {request.text}")
     return StreamingResponse(generate_token_stream(request), media_type="audio/l16;rate=24000")
 
 @app.post("/tts/interrupt")

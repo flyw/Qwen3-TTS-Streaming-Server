@@ -122,7 +122,7 @@ class TextFrontend:
 
     def normalize(self, text: str, language: str = "Chinese"):
         if not text: return "", language
-
+        
         # 0. 网址处理 (在所有正则处理之前)
         text = self._handle_urls(text)
 
@@ -146,4 +146,8 @@ class TextFrontend:
         text = self._handle_abbreviations(text)
         text = re.sub(r'\s+', ' ', text).strip()
         text = re.sub(r'[。，,]{2,}', '。 ', text)
+
+        # 记录处理后的结果
+        logger.info(f"--- TN Output ---\n{text}\n-----------------")
+        
         return text, actual_lang
