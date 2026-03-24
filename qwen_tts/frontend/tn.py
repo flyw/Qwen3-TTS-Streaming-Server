@@ -105,14 +105,21 @@ class TextFrontend:
 
     def _handle_urls(self, text: str) -> str:
         """
-        使用严格的 URL 匹配规则，确保完整识别各种复杂的网址，
-        同时避免吞掉网址末尾的句子标点。
+        严格匹配 URL 格式，确保完整识别多级域名（如 qianlong.com），
+        同时避免遗留 URL 片段或误伤正文标点。
         """
-        # 工业级严格 URL 匹配正则：
-        # 支持 http/https/www，处理括号嵌套，排除末尾标点。
-        url_pattern = r'(?i)\b((?:https?://|www\.)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»“”‘’]))'
+        # 1. 匹配 http/https 或 www 开头
+        # 2. 匹配域名部分：字母数字点中划线，且必须包含点
+        # 3. 匹配可选路径：直到遇到空白、中文或句子结尾标点
+        url_pattern = r'(?:https?://|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z0-9.-]+(?:/[^\s\u4e00-\u9fa5]*)?'
         
-        return re.sub(url_pattern, ' 屏幕上的网页连接 ', text)
+        def replace_func(match):
+            full_url = match.group(0)
+            # 剔除末尾抓到的属于句子结构的标点符号
+            full_url = re.sub(r'[，。！、？,.!?;:]+$', '', full_url)
+            return ' 屏幕上的网页连接 '
+
+        return re.sub(url_pattern, replace_func, text, flags=re.IGNORECASE)
 
     def normalize(self, text: str, language: str = "Chinese"):
         if not text: return "", language
