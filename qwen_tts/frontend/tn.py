@@ -105,18 +105,17 @@ class TextFrontend:
 
     def _handle_urls(self, text: str) -> str:
         """
-        严格匹配 URL 格式，确保完整识别多级域名（如 qianlong.com），
-        同时避免遗留 URL 片段或误伤正文标点。
+        严格识别并替换网址，确保完整匹配多级域名及路径，
+        同时在遇到中文或空格时准确停止。
         """
-        # 1. 匹配 http/https 或 www 开头
-        # 2. 匹配域名部分：字母数字点中划线，且必须包含点
-        # 3. 匹配可选路径：直到遇到空白、中文或句子结尾标点
-        url_pattern = r'(?:https?://|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z0-9.-]+(?:/[^\s\u4e00-\u9fa5]*)?'
+        # 1. 匹配协议头 http/https 或 www
+        # 2. 匹配其后所有非空白、非中文的字符
+        url_pattern = r'(?:https?://|www\.)[^\s\u4e00-\u9fa5]+'
         
         def replace_func(match):
-            full_url = match.group(0)
-            # 剔除末尾抓到的属于句子结构的标点符号
-            full_url = re.sub(r'[，。！、？,.!?;:]+$', '', full_url)
+            url = match.group(0)
+            # 3. 递归剔除末尾可能误抓的句子标点（如网址末尾的句号、问号等）
+            url = re.sub(r'[\u3002\uff0c\uff01\uff1f\u3001,.;:!?]+$', '', url)
             return ' 屏幕上的网页连接 '
 
         return re.sub(url_pattern, replace_func, text, flags=re.IGNORECASE)
