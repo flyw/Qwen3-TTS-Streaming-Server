@@ -105,11 +105,13 @@ class TextFrontend:
 
     def _handle_urls(self, text: str) -> str:
         """
-        将网址替换为“屏幕上的网页连接”，避免模型尝试朗读复杂的 URL。
-        支持 http, https, www 等格式。
+        使用严格的 URL 匹配规则，确保完整识别各种复杂的网址，
+        同时避免吞掉网址末尾的句子标点。
         """
-        # 匹配 http://, https:// 或 www. 开头的网址
-        url_pattern = r'(https?://[^\s]+|www\.[^\s]+)'
+        # 工业级严格 URL 匹配正则：
+        # 支持 http/https/www，处理括号嵌套，排除末尾标点。
+        url_pattern = r'(?i)\b((?:https?://|www\.)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»“”‘’]))'
+        
         return re.sub(url_pattern, ' 屏幕上的网页连接 ', text)
 
     def normalize(self, text: str, language: str = "Chinese"):
