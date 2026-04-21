@@ -1,0 +1,25 @@
+[Unit]
+Description=Qwen3TTS Application
+After=network.target docker.service mnt-sda.mount
+Requires=docker.service mnt-sda.mount
+
+[Service]
+Type=simple
+User=digimeta
+Group=digimeta
+WorkingDirectory=/opt/Qwen3-TTS-Streaming-Server
+Environment="PATH=/home/digimeta/miniconda3/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
+Environment="HF_ENDPOINT=https://hf-mirror.com"
+
+# 使用完整的conda路径初始化conda并激活环境
+ExecStart=/bin/bash -c 'eval "$(/home/digimeta/miniconda3/bin/conda shell.bash hook)" && conda activate qwen3-tts && python server.py --ref-audio tts-audio.wav --chunk-size 5'
+
+Restart=always
+RestartSec=10
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
